@@ -153,6 +153,20 @@ class TonearmServer(
                 val seed = query["seed"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() }
                 engine.toJson(engine.get(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true", seed = seed))
             }
+            "search" -> {
+                val engine = discovery ?: return error(exchange, 404, "Discovery is off on this Tonearm server")
+                val q = query["q"]?.trim()?.take(200)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "q is required")
+                try {
+                    engine.toJson(engine.search(q))
+                } catch (e: Exception) {
+                    return error(exchange, 502, "Deezer: ${e.message}")
+                }
+            }
+            "aisearch" -> {
+                val engine = recommendations ?: return error(exchange, 404, "This Tonearm server has no Ollama set up")
+                val q = query["q"]?.trim()?.take(200)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "q is required")
+                engine.toJson(engine.search(q))
+            }
             "discover" -> {
                 val engine = discovery ?: return error(exchange, 404, "Discovery is off on this Tonearm server")
                 engine.toJson(engine.picks(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true"))

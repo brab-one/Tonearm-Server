@@ -35,6 +35,16 @@ data class DiscoveryPick(
 @Serializable
 data class DiscoveryPicks(val picks: List<DiscoveryPick> = emptyList(), val madeAt: Long = 0, val problem: String? = null)
 
+/** What Deezer finds for a search: songs, albums and artists, best first. */
+@Serializable
+data class WebSearch(val songs: List<WebSong> = emptyList(), val albums: List<WebAlbum> = emptyList(), val artists: List<SimilarArtist> = emptyList())
+
+@Serializable
+data class WebSong(val title: String, val artist: String, val album: String? = null, val duration: Int? = null, val coverUrl: String? = null)
+
+@Serializable
+data class WebAlbum(val title: String, val artist: String, val coverUrl: String? = null, val type: String? = null)
+
 /** An artist like another one, and whether the library has them. */
 @Serializable
 data class SimilarArtist(val artist: String, val imageUrl: String? = null, val fans: Long = 0, val inLibrary: Boolean = false)
@@ -80,6 +90,30 @@ class Discovery(
             SimilarArtist(a.str("name"), a.str("picture_medium").ifEmpty { null }, a.long("nb_fan"), normalize(a.str("name")) in library)
         }
     }
+
+    /** Songs, albums and artists matching [query] on Deezer (answers kept for a week like the rest). */
+    fun search(query: String): WebSearch {
+        val q = URLEncoder.encode(query, Charsets.UTF_8)
+        val songs = pool.submit<List<WebSong>> {
+            get("/search?q=$q&limit=15")["data"]?.jsonArray.orEmpty().map { it.jsonObject }.map { t ->
+                val album = t["album"] as? JsonObject
+                WebSong(t.str("title"), (t["artist"] as? JsonObject)?.str("name").orEmpty(), album?.str("title")?.ifEmpty { null }, t.long("duration").toInt().takeIf { it > 0 }, album?.str("cover_medium")?.ifEmpty { null })
+            }
+        }
+        val albums = pool.submit<List<WebAlbum>> {
+            get("/search/album?q=$q&limit=10")["data"]?.jsonArray.orEmpty().map { it.jsonObject }.map { a ->
+                WebAlbum(a.str("title"), (a["artist"] as? JsonObject)?.str("name").orEmpty(), a.str("cover_medium").ifEmpty { null }, a.str("record_type").ifEmpty { null })
+            }
+        }
+        val artists = pool.submit<List<SimilarArtist>> {
+            get("/search/artist?q=$q&limit=6")["data"]?.jsonArray.orEmpty().map { it.jsonObject }.map { a ->
+                SimilarArtist(a.str("name"), a.str("picture_medium").ifEmpty { null }, a.long("nb_fan"))
+            }
+        }
+        return WebSearch(songs.get(), albums.get(), artists.get())
+    }
+
+    fun toJson(search: WebSearch): JsonObject = json.encodeToJsonElement(WebSearch.serializer(), search).jsonObject
 
     private fun make(login: Map<String, String>): List<DiscoveryPick> {
         val library = library(login)

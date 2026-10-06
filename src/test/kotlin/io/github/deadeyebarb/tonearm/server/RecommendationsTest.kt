@@ -39,6 +39,12 @@ class RecommendationsTest {
             }
             createContext("/api/chat") { ex ->
                 asked = ex.requestBody.readAllBytes().decodeToString()
+                if ("searched a music library" in asked!!) {
+                    val hits = """{"results":[{"artist":"Portishead","title":"Glory Box","why":"Trip-hop."},{"artist":"Massive Attack","album":"Mezzanine","why":"Dark."},{"artist":"Nobody","why":"No title."}]}"""
+                    return@createContext answer(Json.encodeToString(kotlinx.serialization.json.JsonObject.serializer(), kotlinx.serialization.json.buildJsonObject {
+                        put("message", kotlinx.serialization.json.buildJsonObject { put("content", kotlinx.serialization.json.JsonPrimitive(hits)) })
+                    }), ex)
+                }
                 val picks = """{"recommendations":[
                     {"artist":"Mazzy Star","album":"So Tonight That I Might See","year":1993,"why":"Dreamy and dark like Portishead."},
                     {"artist":"bjork","album":"Homogenic","year":1997,"why":"Already in the library."},
@@ -121,6 +127,16 @@ class RecommendationsTest {
         var now = start
         repeat(50) { if (now.running) { Thread.sleep(100); now = engine.get("alice", login, refresh = false) } }
         return now
+    }
+
+    @Test
+    fun anAiSearchAnswersInTheBackgroundAndIsKept() {
+        var search = engine.search("dreamy 90s trip hop")
+        repeat(50) { if (search.running) { Thread.sleep(100); search = engine.search("dreamy 90s trip hop") } }
+        assertEquals(listOf("Portishead" to "Glory Box", "Massive Attack" to "Mezzanine"), search.hits.map { it.artist to (it.title ?: it.album) })
+        asked = null
+        assertEquals(search, engine.search("Dreamy 90s Trip-Hop"))
+        assertEquals(null, asked)
     }
 
     @Test

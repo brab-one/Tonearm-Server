@@ -12,6 +12,8 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   likes on Navidrome, checked against Lidarr's metadata so made-up albums are dropped. The apps can ask for
   "more like this" (a song, album, artist or playlist), and their **weekly picks** download the first few
   every week.
+- **Search help**: the apps search Deezer (songs, albums, artists) through it alongside the library and YouTube
+  Music, and can ask the AI what a search means ("dreamy 90s trip hop").
 - **Discovery picks and similar artists**, no AI needed: the artists each user plays and likes most, their
   related artists on Deezer's public API (no account or key), ranked by how many of yours point to them,
   without what the library has, each with its best-known album. Artist pages in the apps use the same
@@ -45,7 +47,7 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    ```
 
 6. Click **Deploy**. The log lists what's set up:
-   `Tonearm server 1.3.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
+   `Tonearm server 1.4.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
 
 To update later, open the stack in Dockge and click **Update**.
@@ -81,7 +83,7 @@ docker compose up -d
 5. **Save.** The host's **SSL** settings and **Advanced** tab stay as they are. A client-certificate check
    there (`ssl_verify_client on;`) covers this location too, so the apps' certificate is all they need.
 6. Check it: in a browser that has your client certificate, open
-   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.3.0 is running`.
+   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.4.0 is running`.
 
 If your host's **Advanced** tab already has its own `location` blocks, add this one there instead of
 using the Custom locations tab:
@@ -100,7 +102,8 @@ location /connect-tonearm {
 
 ## 3. The apps
 
-Nothing to set up. Tonearm phone 1.5.0+ and desktop 1.4.0+ look for the server at the music server's
+Nothing to set up. Since phone 1.9.0 and desktop 1.8.0 the apps get Lidarr only through this server (they no
+longer have a Lidarr connection of their own). Tonearm phone 1.5.0+ and desktop 1.4.0+ look for the server at the music server's
 address and use it when it's there (Lidarr, Maloja and AI picks from phone 1.6.0 / desktop 1.5.0). Desktop:
 **Settings → Tonearm Connect** then says "Online through the Tonearm server", and the Lidarr and Maloja
 settings say they come through it; whatever is entered there is only used without the server. AI picks are

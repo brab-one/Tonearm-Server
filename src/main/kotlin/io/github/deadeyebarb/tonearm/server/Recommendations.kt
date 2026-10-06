@@ -52,6 +52,13 @@ fun interface AlbumCheck {
     fun find(pick: AiPick): AiPick?
 }
 
+/** One thing the AI thinks a search means: a song or an album by an artist. */
+@Serializable
+data class AiHit(val artist: String, val title: String? = null, val album: String? = null, val why: String = "")
+
+@Serializable
+data class AiSearch(val query: String, val hits: List<AiHit> = emptyList(), val running: Boolean = false, val problem: String? = null)
+
 /** What a user listens to, as Navidrome knows it. */
 data class Taste(
     val mostPlayed: List<String>,
@@ -79,6 +86,9 @@ class Recommendations(
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val running = ConcurrentHashMap.newKeySet<String>()
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "recommendations").apply { isDaemon = true } }
+    private val searchWorker = Executors.newSingleThreadExecutor { Thread(it, "ai-search").apply { isDaemon = true } }
+    /** AI searches by query, for a day: the same search from anyone gets the same answer. */
+    private val searches = ConcurrentHashMap<String, Pair<AiSearch, Long>>()
 
     /**
      * The user's picks; starts new ones when asked to, or when there are none or they're a week old. A
@@ -109,6 +119,62 @@ class Recommendations(
         return load(user).copy(running = user in running, model = model)
     }
 
+    /**
+     * What the AI makes of a search: songs or albums that fit it, also when it's a description ("dreamy 90s trip
+     * hop", "that song with the whistling"). Runs in the background; ask again for the answer.
+     */
+    fun search(query: String): AiSearch {
+        val key = normalize(query)
+        val now = System.currentTimeMillis()
+        searches[key]?.takeIf { it.first.running || now - it.second < SEARCH_MS }?.let { return it.first }
+        val started = AiSearch(query, running = true)
+        searches[key] = started to now
+        if (searches.size > 500) searches.entries.removeIf { now - it.value.second > SEARCH_MS }
+        searchWorker.execute {
+            val done = try {
+                AiSearch(query, askSearch(query))
+            } catch (e: Exception) {
+                AiSearch(query, problem = "Ollama: ${e.message ?: e.javaClass.simpleName}")
+            }
+            searches[key] = done to System.currentTimeMillis()
+        }
+        return started
+    }
+
+    private fun askSearch(query: String): List<AiHit> {
+        val prompt = "Someone searched a music library for: \"$query\"\n" +
+            "Name up to 8 real songs or albums they most likely mean. If it's a name, give the best-known matches; if it describes " +
+            "music (a mood, era, genre, a line of lyrics, \"that song with…\"), give songs or albums that fit. For each, the artist, " +
+            "the song title or the album title, and a few words on why."
+        val schema = buildJsonObject {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("results") {
+                    put("type", "array")
+                    putJsonObject("items") {
+                        put("type", "object")
+                        putJsonObject("properties") {
+                            putJsonObject("artist") { put("type", "string") }
+                            putJsonObject("title") { put("type", "string") }
+                            putJsonObject("album") { put("type", "string") }
+                            putJsonObject("why") { put("type", "string") }
+                        }
+                        put("required", buildJsonArray { add(JsonPrimitive("artist")); add(JsonPrimitive("why")) })
+                    }
+                }
+            }
+            put("required", JsonArray(listOf(JsonPrimitive("results"))))
+        }
+        val content = chat(prompt, schema, temperature = 0.3)
+        return json.parseToJsonElement(content).jsonObject["results"]?.jsonArray.orEmpty().mapNotNull { element ->
+            val o = element as? JsonObject ?: return@mapNotNull null
+            val hit = AiHit(o.str("artist").trim(), o.str("title").trim().ifEmpty { null }, o.str("album").trim().ifEmpty { null }, o.str("why").trim())
+            hit.takeIf { it.artist.isNotEmpty() && (it.title != null || it.album != null) }
+        }.distinctBy { normalize(it.artist) + "|" + normalize(it.title ?: it.album.orEmpty()) }.take(8)
+    }
+
+    fun toJson(search: AiSearch): JsonObject = json.encodeToJsonElement(AiSearch.serializer(), search).jsonObject
+
     /** Reads the user's listening from Navidrome with their login. */
     fun taste(login: Map<String, String>): Taste {
         fun albums(type: String, size: Int) = subsonic("getAlbumList2", login + mapOf("type" to type, "size" to "$size"))["albumList2"]
@@ -137,25 +203,7 @@ class Recommendations(
             if (taste.liked.isNotEmpty()) appendLine("\nLiked:\n" + taste.liked.joinToString("\n"))
             if (before.isNotEmpty()) appendLine("\nAlready suggested before (don't repeat):\n" + before.joinToString("\n") { "${it.artist} – ${it.album}" })
         }
-        val body = buildJsonObject {
-            put("model", model)
-            put("stream", false)
-            putJsonArray("messages") {
-                add(buildJsonObject { put("role", "system"); put("content", "You are a music critic with deep knowledge of albums across all genres. Answer only with the requested JSON.") })
-                add(buildJsonObject { put("role", "user"); put("content", prompt) })
-            }
-            put("format", SCHEMA)
-            putJsonObject("options") { put("temperature", 0.8); put("num_ctx", 8192) }
-        }
-        val request = HttpRequest.newBuilder(URI.create(ollamaUrl.trimEnd('/') + "/api/chat"))
-            .timeout(Duration.ofMinutes(15))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-            .build()
-        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
-        if (response.statusCode() !in 200..299) throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(200)}")
-        val content = json.parseToJsonElement(response.body()).jsonObject["message"]?.jsonObject?.str("content")
-            ?: throw IllegalStateException("no answer")
+        val content = chat(prompt, SCHEMA, temperature = 0.8)
         val picks = json.parseToJsonElement(content).jsonObject["recommendations"]?.jsonArray.orEmpty().mapNotNull { element ->
             val o = element as? JsonObject ?: return@mapNotNull null
             AiPick(o.str("artist").trim(), o.str("album").trim(), o["year"]?.jsonPrimitive?.contentOrNull?.toIntOrNull(), o.str("why").trim())
@@ -174,6 +222,29 @@ class Recommendations(
             .distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
             .take(12)
             .toList()
+    }
+
+    /** One structured answer from the model. */
+    private fun chat(prompt: String, schema: JsonObject, temperature: Double): String {
+        val body = buildJsonObject {
+            put("model", model)
+            put("stream", false)
+            putJsonArray("messages") {
+                add(buildJsonObject { put("role", "system"); put("content", "You are a music critic with deep knowledge of albums across all genres. Answer only with the requested JSON.") })
+                add(buildJsonObject { put("role", "user"); put("content", prompt) })
+            }
+            put("format", schema)
+            putJsonObject("options") { put("temperature", temperature); put("num_ctx", 8192) }
+        }
+        val request = HttpRequest.newBuilder(URI.create(ollamaUrl.trimEnd('/') + "/api/chat"))
+            .timeout(Duration.ofMinutes(15))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+            .build()
+        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() !in 200..299) throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(200)}")
+        return json.parseToJsonElement(response.body()).jsonObject["message"]?.jsonObject?.str("content")
+            ?: throw IllegalStateException("no answer")
     }
 
     private fun subsonic(method: String, params: Map<String, String>): JsonObject {
@@ -207,6 +278,7 @@ class Recommendations(
     companion object {
         private const val MAX_AGE_MS = 7L * 24 * 3_600_000
         private const val MIN_NEW = 3
+        private const val SEARCH_MS = 24 * 3_600_000L
 
         /** Ollama's structured output: the answer has to fit this. */
         private val SCHEMA = buildJsonObject {

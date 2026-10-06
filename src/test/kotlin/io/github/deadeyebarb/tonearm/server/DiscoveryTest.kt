@@ -51,6 +51,8 @@ class DiscoveryTest {
                     path == "/artist/1/related" -> """{"data":[${artist(3, "Massive Attack")},${artist(10, "Tricky")},${artist(11, "Björk")},${artist(12, "Air")}]}"""
                     path == "/artist/2/related" -> """{"data":[${artist(11, "Björk")},${artist(13, "Muse")},${artist(1, "Portishead")}]}"""
                     path == "/artist/3/related" -> """{"data":[${artist(10, "Tricky")},${artist(1, "Portishead")}]}"""
+                    path == "/search" -> """{"data":[{"title":"Glory Box","duration":306,"artist":{"name":"Portishead"},"album":{"title":"Dummy","cover_medium":"https://img/dummy.jpg"}}]}"""
+                    path == "/search/album" -> """{"data":[{"title":"Dummy","record_type":"album","cover_medium":"https://img/dummy.jpg","artist":{"name":"Portishead"}}]}"""
                     path == "/artist/11/albums" -> """{"data":[
                         {"title":"Homogenic","record_type":"album","fans":500,"release_date":"1997-09-22","cover_medium":"https://img/homogenic.jpg"},
                         {"title":"Live at Royal Opera House","record_type":"album","fans":900,"release_date":"2002-01-01"},
@@ -89,6 +91,14 @@ class DiscoveryTest {
         discovery.picks("alice", login, refresh = false)
         assertEquals(calls, deezerCalls)
         assertTrue(discovery.picks("alice", login, refresh = true).picks.isNotEmpty())
+    }
+
+    @Test
+    fun searchFindsSongsAlbumsAndArtists() {
+        val found = discovery.search("portishead")
+        assertEquals(WebSong("Glory Box", "Portishead", "Dummy", 306, "https://img/dummy.jpg"), found.songs.single())
+        assertEquals(WebAlbum("Dummy", "Portishead", "https://img/dummy.jpg", "album"), found.albums.single())
+        assertEquals("Portishead", found.artists.single().artist)
     }
 
     @Test
