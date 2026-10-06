@@ -12,6 +12,10 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   likes on Navidrome, checked against Lidarr's metadata so made-up albums are dropped. The apps can ask for
   "more like this" (a song, album, artist or playlist), and their **weekly picks** download the first few
   every week.
+- **Discovery picks and similar artists**, no AI needed: the artists each user plays and likes most, their
+  related artists on Deezer's public API (no account or key), ranked by how many of yours point to them,
+  without what the library has, each with its best-known album. Artist pages in the apps use the same
+  source for similar artists.
 
 Everybody signs in with their own Navidrome login: the apps send the same login they use for music,
 and the server asks Navidrome whether it's valid (and whether they're an admin).
@@ -41,7 +45,7 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    ```
 
 6. Click **Deploy**. The log lists what's set up:
-   `Tonearm server 1.2.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
+   `Tonearm server 1.3.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
 
 To update later, open the stack in Dockge and click **Update**.
@@ -77,7 +81,7 @@ docker compose up -d
 5. **Save.** The host's **SSL** settings and **Advanced** tab stay as they are. A client-certificate check
    there (`ssl_verify_client on;`) covers this location too, so the apps' certificate is all they need.
 6. Check it: in a browser that has your client certificate, open
-   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.2.0 is running`.
+   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.3.0 is running`.
 
 If your host's **Advanced** tab already has its own `location` blocks, add this one there instead of
 using the Custom locations tab:
@@ -120,6 +124,7 @@ the plugin can stay installed or go.
 | `MALOJA_USERS` | (Navidrome admins) | Comma-separated Navidrome users who get Maloja |
 | `OLLAMA_URL` | | Ollama for AI picks |
 | `OLLAMA_MODEL` | `qwen2.5` | |
+| `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |
 
 Every request except `/connect-tonearm/health` needs a valid Navidrome login. An address with 20 failed
 logins in 5 minutes is turned away for a while. Lidarr's and Maloja's keys never leave the server; what

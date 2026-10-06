@@ -30,6 +30,7 @@ class TonearmServer(
     private val lidarr: LidarrProxy? = null,
     private val maloja: MalojaProxy? = null,
     private val recommendations: Recommendations? = null,
+    private val discovery: Discovery? = null,
 ) {
     private val base = "/" + basePath.trim('/')
     private val hub = Hub()
@@ -94,6 +95,7 @@ class TonearmServer(
                 put("lidarrAdmin", lidarr != null && login.admin)
                 put("maloja", maloja?.available(user, login.admin) == true)
                 put("recommendations", recommendations != null)
+                put("discovery", discovery != null)
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")
@@ -150,6 +152,20 @@ class TonearmServer(
                 val engine = recommendations ?: return error(exchange, 404, "This Tonearm server has no Ollama set up")
                 val seed = query["seed"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() }
                 engine.toJson(engine.get(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true", seed = seed))
+            }
+            "discover" -> {
+                val engine = discovery ?: return error(exchange, 404, "Discovery is off on this Tonearm server")
+                engine.toJson(engine.picks(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true"))
+            }
+            "similar" -> {
+                val engine = discovery ?: return error(exchange, 404, "Discovery is off on this Tonearm server")
+                val artist = query["artist"]?.trim()?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
+                val (name, similar) = try {
+                    engine.similar(user, NavidromeAuth.loginOf(query), artist)
+                } catch (e: Exception) {
+                    return error(exchange, 502, "Couldn't look up similar artists: ${e.message}")
+                }
+                engine.toJson(name, similar)
             }
             else -> return error(exchange, 404, "Unknown op")
         }

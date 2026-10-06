@@ -8,7 +8,8 @@ import kotlin.system.exitProcess
  * handing out their keys. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
  * /connect-tonearm), PORT (8790), DATA_DIR (/data); optional LIDARR_URL + LIDARR_API_KEY (+ LIDARR_REQUESTS
  * = all | admins), MALOJA_URL + MALOJA_API_KEY (+ MALOJA_USERS, else Navidrome admins), and OLLAMA_URL
- * (+ OLLAMA_MODEL, default qwen2.5) for album suggestions.
+ * (+ OLLAMA_MODEL, default qwen2.5) for album suggestions. Discovery picks and similar artists come from
+ * Deezer's public API (DISCOVERY=off turns that off).
  */
 fun main() {
     val navidrome = env("NAVIDROME_URL") ?: run {
@@ -37,11 +38,13 @@ fun main() {
     val recommendations = env("OLLAMA_URL")?.let { url ->
         Recommendations(url, env("OLLAMA_MODEL") ?: "qwen2.5", navidrome, dataDir, lidarr?.let { proxy -> AlbumCheck(proxy::findAlbum) })
     }
-    TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, maloja, recommendations).start()
+    val discovery = if (env("DISCOVERY")?.lowercase() == "off") null else Discovery(navidrome, dataDir)
+    TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, maloja, recommendations, discovery).start()
     println("Tonearm server $version on port $port under ${"/" + basePath.trim('/')}, checking logins with Navidrome at $navidrome, data in $dataDir")
     println("Lidarr: " + (env("LIDARR_URL")?.let { "$it, " + if (lidarr!!.available(false)) "requests for everyone" else "admins only" } ?: "not set up"))
     println("Maloja: " + (env("MALOJA_URL")?.let { "$it for " + (env("MALOJA_USERS") ?: "Navidrome admins") } ?: "not set up"))
     println("Recommendations: " + (env("OLLAMA_URL")?.let { "Ollama at $it with " + (env("OLLAMA_MODEL") ?: "qwen2.5") } ?: "not set up"))
+    println("Discovery and similar artists: " + if (discovery != null) "from Deezer" else "off")
 }
 
 private fun env(name: String): String? = System.getenv(name)?.takeIf { it.isNotBlank() }
