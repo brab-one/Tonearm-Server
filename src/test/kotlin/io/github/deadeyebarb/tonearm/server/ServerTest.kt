@@ -23,12 +23,18 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-/** The whole server against a fake Navidrome that knows alice (password "wonderland") and bob (API key "bobkey"). */
+/**
+ * The whole server against a fake Navidrome that knows alice (password "wonderland", an admin) and bob
+ * (API key "bobkey"), and a fake Lidarr and Maloja that record what reaches them.
+ */
 class ServerTest {
     private lateinit var navidrome: HttpServer
     private lateinit var server: TonearmServer
     private val http = HttpClient.newHttpClient()
     private var navidromeCalls = 0
+    private lateinit var upstream: HttpServer
+    /** What reached the fake Lidarr/Maloja: method, path?query, X-Api-Key, body. */
+    private val received = mutableListOf<List<String?>>()
 
     @BeforeTest
     fun start() {
@@ -44,6 +50,7 @@ class ServerTest {
                 }
                 val body = if (!ok) """{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"""
                 else if (ex.requestURI.path.endsWith("/tokenInfo.view")) """{"subsonic-response":{"status":"ok","tokenInfo":{"username":"Bob"}}}"""
+                else if (ex.requestURI.path.endsWith("/getUser.view")) """{"subsonic-response":{"status":"ok","user":{"username":"${q["username"]}","adminRole":${q["username"]?.lowercase() == "alice"}}}}"""
                 else """{"subsonic-response":{"status":"ok"}}"""
                 val bytes = body.encodeToByteArray()
                 ex.sendResponseHeaders(200, bytes.size.toLong())
@@ -51,13 +58,37 @@ class ServerTest {
             }
             start()
         }
-        server = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), Files.createTempDirectory("tonearm-server").toFile(), "test").start()
+        upstream = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            createContext("/") { ex ->
+                val body = ex.requestBody.readAllBytes().decodeToString()
+                synchronized(received) {
+                    received += listOf(ex.requestMethod, ex.requestURI.rawPath + (ex.requestURI.rawQuery?.let { "?$it" } ?: ""), ex.requestHeaders.getFirst("X-Api-Key"), body)
+                }
+                val (type, bytes) = when (ex.requestURI.path) {
+                    "/api/v1/rootfolder" -> "application/json" to """[{"path":"/music/"}]""".encodeToByteArray()
+                    "/api/v1/mediacover/artist/1/poster-250.jpg" -> "image/jpeg" to byteArrayOf(1, 2, 3)
+                    else -> "application/json" to """{"ok":true}""".encodeToByteArray()
+                }
+                ex.responseHeaders.set("Content-Type", type)
+                ex.responseHeaders.set("Cache-Control", "public, max-age=31536000")
+                ex.sendResponseHeaders(200, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
+            start()
+        }
+        val up = "http://127.0.0.1:${upstream.address.port}"
+        server = TonearmServer(
+            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), Files.createTempDirectory("tonearm-server").toFile(), "test",
+            LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), requestsForEveryone = true),
+            MalojaProxy(Upstream("Maloja", up, null, "maloja-secret"), "maloja-secret", emptySet()),
+        ).start()
     }
 
     @AfterTest
     fun stop() {
         server.stop()
         navidrome.stop(0)
+        upstream.stop(0)
     }
 
     private fun md5(text: String) = MessageDigest.getInstance("MD5").digest(text.encodeToByteArray()).joinToString("") { "%02x".format(it) }
@@ -67,12 +98,24 @@ class ServerTest {
         return listOf("u" to "alice", "t" to md5("wonderland$salt"), "s" to salt, "v" to "1.16.1", "c" to "Tonearm", "f" to "json")
     }
 
-    private fun call(path: String, params: List<Pair<String, Any>> = emptyList(), body: String = "", headers: Map<String, String> = emptyMap()): Pair<Int, String> {
+    private fun call(
+        path: String,
+        params: List<Pair<String, Any>> = emptyList(),
+        body: String = "",
+        headers: Map<String, String> = emptyMap(),
+        method: String = "POST",
+    ): Pair<Int, String> {
         val query = params.joinToString("&") { (k, v) -> k + "=" + URLEncoder.encode(v.toString(), Charsets.UTF_8) }
         val request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${server.boundPort}$path?$query"))
-            .POST(HttpRequest.BodyPublishers.ofString(body)).apply { headers.forEach { (k, v) -> header(k, v) } }.build()
+            .method(method, if (body.isEmpty()) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofString(body))
+            .apply { headers.forEach { (k, v) -> header(k, v) } }.build()
         return http.send(request, HttpResponse.BodyHandlers.ofString()).let { it.statusCode() to it.body() }
     }
+
+    private val bob = listOf("apiKey" to "bobkey")
+
+    private fun lidarr(method: String, path: String, login: List<Pair<String, String>>, params: List<Pair<String, Any>> = emptyList(), body: String = "") =
+        call("/connect-tonearm/lidarr/api/v1/$path", login + params, body, method = method)
 
     private fun api(op: String, auth: List<Pair<String, String>>, params: List<Pair<String, Any>> = emptyList(), body: String = ""): JsonObject {
         val (code, text) = call("/connect-tonearm/api/$op", auth + params, body)
@@ -146,6 +189,90 @@ class ServerTest {
         val before = navidromeCalls
         api("devices", login)
         assertEquals(before, navidromeCalls)
+    }
+
+    @Test
+    fun helloSaysWhatThisUserGets() {
+        val alice = api("hello", alice())
+        assertEquals("true", alice["admin"]!!.jsonPrimitive.content)
+        assertEquals("true", alice["lidarr"]!!.jsonPrimitive.content)
+        assertEquals("true", alice["lidarrAdmin"]!!.jsonPrimitive.content)
+        assertEquals("true", alice["maloja"]!!.jsonPrimitive.content)
+        val bob = api("hello", bob)
+        assertEquals("false", bob["admin"]!!.jsonPrimitive.content)
+        assertEquals("true", bob["lidarr"]!!.jsonPrimitive.content)
+        assertEquals("false", bob["lidarrAdmin"]!!.jsonPrimitive.content)
+        assertEquals("false", bob["maloja"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun adminsReachAllOfLidarrWithTheServersKeyAndWithoutTheirLogin() {
+        assertEquals(200, lidarr("DELETE", "artist/5", alice(), listOf("deleteFiles" to true, "apikey" to "theirs")).first)
+        val (method, path, key) = received.single()
+        assertEquals("DELETE", method)
+        assertEquals("/api/v1/artist/5?deleteFiles=true", path)
+        assertEquals("lidarr-secret", key)
+    }
+
+    @Test
+    fun everyoneElseCanLookAndRequestButNotChangeLidarr() {
+        assertEquals(200, lidarr("GET", "queue", bob, listOf("page" to 1)).first)
+        assertEquals(200, lidarr("GET", "album/lookup", bob, listOf("term" to "OK Computer")).first)
+        assertEquals(200, lidarr("POST", "command", bob, body = """{"name":"AlbumSearch","albumIds":[3]}""").first)
+        assertEquals(200, lidarr("PUT", "album/monitor", bob, body = """{"albumIds":[3],"monitored":true}""").first)
+        for ((method, path, body) in listOf(
+            Triple("DELETE", "artist/5", ""),
+            Triple("GET", "importlist", ""),
+            Triple("GET", "config/host", ""),
+            Triple("POST", "command", """{"name":"ImportListSync","definitionId":1}"""),
+            Triple("PUT", "album/monitor", """{"albumIds":[3],"monitored":false}"""),
+            Triple("POST", "albumstudio", "{}"),
+            Triple("POST", "tag", """{"label":"x"}"""),
+        )) {
+            val (code, text) = lidarr(method, path, bob, body = body)
+            assertEquals(403, code, "$method $path")
+            assertTrue("admins" in text)
+        }
+        assertEquals(4, received.size)
+    }
+
+    @Test
+    fun requestsLandInLidarrsRootFoldersWithoutTags() {
+        val artist = """{"artistName":"Radiohead","rootFolderPath":"/music","path":"/elsewhere/Radiohead","tags":[7],"qualityProfileId":1}"""
+        assertEquals(200, lidarr("POST", "artist", bob, body = artist).first)
+        val sent = Json.parseToJsonElement(received.last()[3]!!).jsonObject
+        assertEquals(null, sent["path"])
+        assertTrue(sent["tags"]!!.jsonArray.isEmpty())
+        assertEquals(400, lidarr("POST", "artist", bob, body = """{"artistName":"x","rootFolderPath":"/etc"}""").first)
+        assertEquals(400, lidarr("POST", "album", bob, body = """{"title":"x","artist":{"rootFolderPath":"/tmp"}}""").first)
+        assertEquals(200, lidarr("POST", "album", bob, body = """{"title":"x","artist":{"rootFolderPath":"/music/","tags":[7]}}""").first)
+        assertTrue(Json.parseToJsonElement(received.last()[3]!!).jsonObject["artist"]!!.jsonObject["tags"]!!.jsonArray.isEmpty())
+    }
+
+    @Test
+    fun pathsCantClimbOutOfTheApi() {
+        assertEquals(404, lidarr("GET", "../../ping", alice()).first)
+        assertEquals(404, call("/connect-tonearm/lidarr/api/v1/mediacover/artist/1/..", bob, method = "GET").first)
+        assertEquals(404, call("/connect-tonearm/lidarr/other", alice(), method = "GET").first)
+        assertTrue(received.none { it[1]!!.contains("ping") })
+    }
+
+    @Test
+    fun coversComeThroughAsImages() {
+        val request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${server.boundPort}/connect-tonearm/lidarr/api/v1/mediacover/artist/1/poster-250.jpg?apiKey=bobkey")).GET().build()
+        val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())
+        assertEquals(200, response.statusCode())
+        assertEquals("image/jpeg", response.headers().firstValue("Content-Type").get())
+        assertEquals(3, response.body().size)
+    }
+
+    @Test
+    fun malojaGetsItsKeyAndIsOnlyForItsUsers() {
+        assertEquals(200, call("/connect-tonearm/maloja/apis/mlj_1/charts/artists", alice() + listOf("max" to 5), method = "GET").first)
+        assertTrue(received.last()[1]!!.endsWith("?max=5&key=maloja-secret"))
+        assertEquals(200, call("/connect-tonearm/maloja/apis/mlj_1/newscrobble", alice(), """{"artists":["a"],"title":"b","key":""}""").first)
+        assertEquals("maloja-secret", Json.parseToJsonElement(received.last()[3]!!).jsonObject["key"]!!.jsonPrimitive.content)
+        assertEquals(403, call("/connect-tonearm/maloja/apis/mlj_1/charts/artists", bob, method = "GET").first)
     }
 
     @Test

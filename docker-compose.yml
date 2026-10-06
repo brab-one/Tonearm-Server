@@ -8,6 +8,12 @@ services:
       NAVIDROME_URL: http://192.168.1.11:4533
       # Has to match the custom location in Nginx Proxy Manager.
       BASE_PATH: /connect-tonearm
+      # Optional, from the stack's .env; leave any out to skip it.
+      LIDARR_URL: ${LIDARR_URL:-}
+      LIDARR_API_KEY: ${LIDARR_API_KEY:-}
+      MALOJA_URL: ${MALOJA_URL:-}
+      MALOJA_API_KEY: ${MALOJA_API_KEY:-}
+      OLLAMA_URL: ${OLLAMA_URL:-}
     ports:
       - "8790:8790"
     volumes:

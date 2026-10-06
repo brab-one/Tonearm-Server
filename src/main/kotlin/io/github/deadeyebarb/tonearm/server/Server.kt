@@ -18,7 +18,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The Tonearm server's HTTP side. Everything lives under [basePath] (where the proxy sends it):
- * `api/<op>` for the apps, `health` for Docker, and a short status text at the root.
+ * `api/<op>` for Connect, `lidarr/…` and `maloja/…` for those services with the server's keys,
+ * `health` for Docker, and a short status text at the root.
  */
 class TonearmServer(
     private val port: Int,
@@ -26,6 +27,9 @@ class TonearmServer(
     private val auth: NavidromeAuth,
     dataDir: File,
     private val version: String,
+    private val lidarr: LidarrProxy? = null,
+    private val maloja: MalojaProxy? = null,
+    private val recommendations: Recommendations? = null,
 ) {
     private val base = "/" + basePath.trim('/')
     private val hub = Hub()
@@ -52,21 +56,31 @@ class TonearmServer(
         when {
             path == "health" -> return text(exchange, 200, "ok")
             path.isEmpty() -> return text(exchange, 200, "Tonearm server $version is running. The Tonearm apps use it at $base/api/.")
-            !path.startsWith("api/") -> return text(exchange, 404, "Not found")
+            !path.startsWith("api/") && !path.startsWith("lidarr/") && !path.startsWith("maloja/") -> return text(exchange, 404, "Not found")
         }
-        val op = path.removePrefix("api/")
         val query = parseQuery(exchange.requestURI.rawQuery)
         val client = exchange.requestHeaders.getFirst("X-Real-IP") ?: exchange.requestHeaders.getFirst("X-Forwarded-For")?.substringBefore(',')?.trim()
             ?: exchange.remoteAddress.address.hostAddress
-        val user = when (val result = auth.check(query, client)) {
-            is NavidromeAuth.Result.Ok -> result.user
+        val login = when (val result = auth.check(query, client)) {
+            is NavidromeAuth.Result.Ok -> result
             NavidromeAuth.Result.Missing -> return error(exchange, 401, "Sign in with your Navidrome login (u + t/s, u + p, or apiKey)")
             NavidromeAuth.Result.Rejected -> return error(exchange, 401, "Navidrome didn't accept that login")
             NavidromeAuth.Result.TooMany -> return error(exchange, 429, "Too many failed logins; try again in a few minutes")
             is NavidromeAuth.Result.Unreachable -> return error(exchange, 502, result.message)
         }
-        val payload = exchange.requestBody.use { it.readNBytes(MAX_PAYLOAD + 1) }.decodeToString()
-        if (payload.length > MAX_PAYLOAD) return error(exchange, 413, "Payload too large")
+        val user = login.user
+        val bytes = exchange.requestBody.use { it.readNBytes(MAX_PAYLOAD + 1) }
+        if (bytes.size > MAX_PAYLOAD) return error(exchange, 413, "Payload too large")
+        if (!path.startsWith("api/")) {
+            val call = ProxyCall(exchange.requestMethod.uppercase(), path.substringAfter('/'), exchange.requestURI.rawQuery, exchange.requestHeaders.getFirst("Content-Type"), bytes)
+            val answer = when {
+                path.startsWith("lidarr/") -> lidarr?.handle(call, login.admin) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up")
+                else -> maloja?.handle(call, user, login.admin) ?: Upstream.error(404, "This Tonearm server has no Maloja set up")
+            }
+            return relay(exchange, answer)
+        }
+        val op = path.removePrefix("api/")
+        val payload = bytes.decodeToString()
         val device = query["device"]
         val users = hub.of(user)
         val response: JsonObject = when (op) {
@@ -75,6 +89,11 @@ class TonearmServer(
                 put("protocol", PROTOCOL)
                 put("version", version)
                 put("user", user)
+                put("admin", login.admin)
+                put("lidarr", lidarr?.available(login.admin) == true)
+                put("lidarrAdmin", lidarr != null && login.admin)
+                put("maloja", maloja?.available(user, login.admin) == true)
+                put("recommendations", recommendations != null)
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")
@@ -127,6 +146,10 @@ class TonearmServer(
                     put("version", current.version)
                 }
             }
+            "recommendations" -> {
+                val engine = recommendations ?: return error(exchange, 404, "This Tonearm server has no Ollama set up")
+                engine.toJson(engine.get(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true"))
+            }
             else -> return error(exchange, 404, "Unknown op")
         }
         send(exchange, 200, response)
@@ -146,6 +169,13 @@ class TonearmServer(
         exchange.responseHeaders.set("Cache-Control", "no-store")
         exchange.sendResponseHeaders(code, bytes.size.toLong())
         exchange.responseBody.use { it.write(bytes) }
+    }
+
+    private fun relay(exchange: HttpExchange, answer: ProxyAnswer) {
+        exchange.responseHeaders.set("Content-Type", answer.contentType ?: "application/octet-stream")
+        exchange.responseHeaders.set("Cache-Control", answer.cacheControl ?: "no-store")
+        exchange.sendResponseHeaders(answer.status, if (answer.body.isEmpty()) -1 else answer.body.size.toLong())
+        exchange.responseBody.use { if (answer.body.isNotEmpty()) it.write(answer.body) }
     }
 
     private fun text(exchange: HttpExchange, code: Int, body: String) {
