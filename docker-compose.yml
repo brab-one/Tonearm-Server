@@ -1,0 +1,17 @@
+services:
+  tonearm-server:
+    image: ghcr.io/brab-one/tonearm-server:latest
+    container_name: tonearm-server
+    restart: unless-stopped
+    environment:
+      # Navidrome as this container reaches it directly, not through the proxy.
+      NAVIDROME_URL: http://192.168.1.11:4533
+      # Has to match the custom location in Nginx Proxy Manager.
+      BASE_PATH: /connect-tonearm
+    ports:
+      - "8790:8790"
+    volumes:
+      - tonearm-data:/data
+
+volumes:
+  tonearm-data:

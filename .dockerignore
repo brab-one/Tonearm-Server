@@ -1,0 +1,7 @@
+.gradle
+.kotlin
+build
+data
+.git
+.github
+*.md
