@@ -33,7 +33,7 @@ data class DiscoveryPick(
 )
 
 @Serializable
-data class DiscoveryPicks(val picks: List<DiscoveryPick> = emptyList(), val madeAt: Long = 0, val problem: String? = null)
+data class DiscoveryPicks(val picks: List<DiscoveryPick> = emptyList(), val madeAt: Long = 0, val running: Boolean = false, val problem: String? = null)
 
 /** What Deezer finds for a search: songs, albums and artists, best first. */
 @Serializable
@@ -52,7 +52,8 @@ data class SimilarArtist(val artist: String, val imageUrl: String? = null, val f
 /**
  * Discovery without an AI: the artists a user plays and likes most on Navidrome (asked as them, with their
  * login), their related artists on Deezer's public API, ranked by how many of the user's artists point to
- * them, without what the library has. Each comes with its best-known studio album. Kept for a day.
+ * them, without what the library has. Each comes with its best-known studio album. Kept for a day, and made
+ * in the background: a slow Deezer or Navidrome never keeps a request (and a proxy in front) waiting.
  */
 class Discovery(
     private val navidromeUrl: String,
@@ -65,20 +66,28 @@ class Discovery(
     /** Deezer answers by URL, for a week: artists' relations and albums barely change. */
     private val cache = ConcurrentHashMap<String, Pair<JsonObject, Long>>()
     private val pool = Executors.newFixedThreadPool(4) { Thread(it, "discovery").apply { isDaemon = true } }
+    private val worker = Executors.newSingleThreadExecutor { Thread(it, "discovery-picks").apply { isDaemon = true } }
+    private val running = ConcurrentHashMap.newKeySet<String>()
     /** Each user's library artists for a few minutes, for "similar" on artist pages. */
     private val libraries = ConcurrentHashMap<String, Pair<Set<String>, Long>>()
 
+    /** The user's picks; new ones are started when asked to or when they're a day old ([DiscoveryPicks.running] until then). */
     fun picks(user: String, login: Map<String, String>, refresh: Boolean): DiscoveryPicks {
         val stored = load(user)
-        if (!refresh && stored.madeAt > 0 && System.currentTimeMillis() - stored.madeAt < MAX_AGE_MS) return stored
-        val made = try {
-            DiscoveryPicks(make(login), System.currentTimeMillis())
-        } catch (e: Exception) {
-            return stored.copy(problem = "Discovery: ${e.message ?: e.javaClass.simpleName}")
+        val due = refresh || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt >= MAX_AGE_MS
+        if (due && running.add(user)) {
+            worker.execute {
+                try {
+                    val made = DiscoveryPicks(make(login), System.currentTimeMillis())
+                    save(user, if (made.picks.isEmpty() && stored.picks.isNotEmpty()) stored.copy(madeAt = made.madeAt, problem = "Nothing new to discover this time") else made)
+                } catch (e: Exception) {
+                    save(user, load(user).copy(problem = "Discovery: ${e.message ?: e.javaClass.simpleName}"))
+                } finally {
+                    running.remove(user)
+                }
+            }
         }
-        if (made.picks.isEmpty() && stored.picks.isNotEmpty()) return stored.copy(problem = "Nothing new to discover this time")
-        save(user, made)
-        return made
+        return load(user).copy(running = user in running)
     }
 
     /** Artists like [artist] (by name), marked when the user's library has them. */
@@ -217,7 +226,7 @@ class Discovery(
     private fun save(user: String, picks: DiscoveryPicks) {
         val f = file(user)
         val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(DiscoveryPicks.serializer(), picks))
+        tmp.writeText(json.encodeToString(DiscoveryPicks.serializer(), picks.copy(running = false)))
         if (!tmp.renameTo(f)) {
             f.delete()
             tmp.renameTo(f)

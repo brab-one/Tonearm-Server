@@ -9,6 +9,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** Against a fake Navidrome (one user's listening) and a fake Deezer. */
@@ -71,9 +72,21 @@ class DiscoveryTest {
     @AfterTest
     fun stop() = fake.stop(0)
 
+    /** Picks are made in the background: asks again until they're done. */
+    private fun picks(refresh: Boolean = false): DiscoveryPicks {
+        var picks = discovery.picks("alice", login, refresh)
+        val until = System.currentTimeMillis() + 10_000
+        while (picks.running && System.currentTimeMillis() < until) {
+            Thread.sleep(20)
+            picks = discovery.picks("alice", login, refresh = false)
+        }
+        return picks
+    }
+
     @Test
     fun picksAreArtistsSeveralOfYoursPointToWithoutTheLibrary() {
-        val picks = discovery.picks("alice", login, refresh = false).picks
+        assertTrue(discovery.picks("alice", login, refresh = false).running)
+        val picks = picks().picks
         assertEquals(listOf("Björk", "Muse", "Tricky", "Air"), picks.map { it.artist })
         val bjork = picks.first()
         assertEquals(listOf("Radiohead", "Portishead"), bjork.because)
@@ -86,11 +99,11 @@ class DiscoveryTest {
 
     @Test
     fun picksAreKeptForADay() {
-        discovery.picks("alice", login, refresh = false)
+        picks()
         val calls = deezerCalls
-        discovery.picks("alice", login, refresh = false)
+        assertFalse(discovery.picks("alice", login, refresh = false).running)
         assertEquals(calls, deezerCalls)
-        assertTrue(discovery.picks("alice", login, refresh = true).picks.isNotEmpty())
+        assertTrue(picks(refresh = true).picks.isNotEmpty())
     }
 
     @Test

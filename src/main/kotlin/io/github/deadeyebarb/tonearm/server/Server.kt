@@ -39,7 +39,18 @@ class TonearmServer(
 
     fun start(): TonearmServer {
         http = HttpServer.create(InetSocketAddress(port), 0).apply {
-            createContext("/") { exchange -> exchange.use { handle(it) } }
+            createContext("/") { exchange ->
+                exchange.use {
+                    try {
+                        handle(it)
+                    } catch (e: Throwable) {
+                        // An answer instead of a dropped connection (which proxies show as a bare 502). No query: it has the login.
+                        System.err.println("${it.requestMethod} ${it.requestURI.rawPath} failed: $e")
+                        e.printStackTrace()
+                        runCatching { error(it, 500, "The Tonearm server failed: ${e.message ?: e.javaClass.simpleName}") }
+                    }
+                }
+            }
             executor = ThreadPoolExecutor(4, 400, 60, TimeUnit.SECONDS, SynchronousQueue())
             start()
         }
