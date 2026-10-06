@@ -69,14 +69,21 @@ class RecommendationsTest {
     }
 
     @Test
-    fun suggestionsLeaveOutTheLibraryRepeatsAndEarlierOnes() {
+    fun suggestionsLeaveOutTheLibraryAndRepeats() {
+        // Only one new one, so the earlier pick comes back after it.
         val picks = engine.ask(engine.taste(login), before = listOf(AiPick("Tricky", "Maxinquaye")))
-        assertEquals(listOf("Mazzy Star"), picks.map { it.artist })
+        assertEquals(listOf("Mazzy Star", "Tricky"), picks.map { it.artist })
         val request = Json.parseToJsonElement(asked!!).jsonObject
         assertEquals("qwen2.5", request["model"]!!.jsonPrimitive.content)
         assertEquals("false", request["stream"]!!.jsonPrimitive.content)
         assertTrue("recommendations" in request["format"].toString())
         assertTrue("Portishead – Dummy" in asked!! && "Tricky – Maxinquaye" in asked!!)
+    }
+
+    @Test
+    fun aSeedAsksForMoreLikeIt() {
+        engine.ask(engine.taste(login), before = emptyList(), seed = "the album “Dummy” by Portishead")
+        assertTrue("more like the album “Dummy” by Portishead" in Json.parseToJsonElement(asked!!).toString().replace("\\u201c", "“").replace("\\u201d", "”"))
     }
 
     @Test
@@ -93,6 +100,27 @@ class RecommendationsTest {
         val unsure = Recommendations(url, "qwen2.5", url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { error("Lidarr's search failed") })
         assertEquals(listOf("Mazzy Star", "Tricky"), unsure.ask(unsure.taste(login), before = emptyList()).map { it.artist })
         assertEquals(Recommendations.bareTitle("OK Computer"), Recommendations.bareTitle("OK Computer (Collector's Edition) [Remastered]"))
+    }
+
+    @Test
+    fun anAnswerWithNothingUsableKeepsThePicksThereAre() {
+        val first = waitFor(engine.get("alice", login, refresh = false))
+        assertEquals(2, first.picks.size)
+        // Next time everything it suggests is in the library.
+        fake.removeContext("/rest/")
+        fake.createContext("/rest/") { ex ->
+            val body = if ("getArtists" in ex.requestURI.path) """"artists":{"index":[{"artist":[{"name":"Mazzy Star"},{"name":"Tricky"},{"name":"Björk"}]}]}""" else """"albumList2":{}"""
+            answer("""{"subsonic-response":{"status":"ok",$body}}""", ex)
+        }
+        val second = waitFor(engine.get("alice", login, refresh = true))
+        assertEquals(first.picks, second.picks)
+        assertEquals("The AI had nothing usable this time", second.problem)
+    }
+
+    private fun waitFor(start: AiPicks): AiPicks {
+        var now = start
+        repeat(50) { if (now.running) { Thread.sleep(100); now = engine.get("alice", login, refresh = false) } }
+        return now
     }
 
     @Test

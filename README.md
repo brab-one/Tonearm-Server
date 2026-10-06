@@ -5,11 +5,13 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
 - **Tonearm Connect**: the apps see and remote-control each other (phone → desktop) and share likes of
   songs that aren't in the library yet.
 - **Lidarr and Maloja without handing out their keys**: the server holds them, so the apps only need the
-  music server login. Navidrome admins get all of Lidarr (Brainarr, weekly picks); everyone else can look
+  music server login. Navidrome admins get all of Lidarr (weekly picks included); everyone else can look
   things up, see downloads and request albums and artists, nothing more. Maloja is one person's history,
   so by default only admins get it.
 - **AI picks**: albums by artists you don't have, suggested by your Ollama from what each user plays and
-  likes on Navidrome, checked against Lidarr's metadata so made-up albums are dropped.
+  likes on Navidrome, checked against Lidarr's metadata so made-up albums are dropped. The apps can ask for
+  "more like this" (a song, album, artist or playlist), and their **weekly picks** download the first few
+  every week.
 
 Everybody signs in with their own Navidrome login: the apps send the same login they use for music,
 and the server asks Navidrome whether it's valid (and whether they're an admin).
@@ -39,7 +41,7 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    ```
 
 6. Click **Deploy**. The log lists what's set up:
-   `Tonearm server 1.1.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
+   `Tonearm server 1.2.0 on port 8790 …`, then a line each for Lidarr, Maloja and Recommendations.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
 
 To update later, open the stack in Dockge and click **Update**.
@@ -75,7 +77,7 @@ docker compose up -d
 5. **Save.** The host's **SSL** settings and **Advanced** tab stay as they are. A client-certificate check
    there (`ssl_verify_client on;`) covers this location too, so the apps' certificate is all they need.
 6. Check it: in a browser that has your client certificate, open
-   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.1.0 is running`.
+   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.2.0 is running`.
 
 If your host's **Advanced** tab already has its own `location` blocks, add this one there instead of
 using the Custom locations tab:

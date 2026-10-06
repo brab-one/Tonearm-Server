@@ -40,6 +40,8 @@ data class AiPicks(
     /** Why the last attempt failed (older picks stay). Not "error": the apps read that as a failed call. */
     val problem: String? = null,
     val model: String = "",
+    /** What the picks were asked to be like ("the album OK Computer by Radiohead"), if anything. */
+    val seed: String? = null,
 )
 
 /**
@@ -78,10 +80,13 @@ class Recommendations(
     private val running = ConcurrentHashMap.newKeySet<String>()
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "recommendations").apply { isDaemon = true } }
 
-    /** The user's picks; starts new ones when asked to, or when there are none or they're a week old. */
-    fun get(user: String, login: Map<String, String>, refresh: Boolean): AiPicks {
+    /**
+     * The user's picks; starts new ones when asked to, or when there are none or they're a week old. A
+     * [seed] asks for albums like that in particular ("more like this").
+     */
+    fun get(user: String, login: Map<String, String>, refresh: Boolean, seed: String? = null): AiPicks {
         val stored = load(user)
-        val due = refresh || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt > MAX_AGE_MS
+        val due = refresh || seed != null || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt > MAX_AGE_MS
         if (due && running.add(user)) {
             val taste = try {
                 taste(login)
@@ -91,8 +96,9 @@ class Recommendations(
             }
             worker.execute {
                 try {
-                    val picks = ask(taste, stored.picks)
-                    save(user, AiPicks(picks, System.currentTimeMillis(), model = model))
+                    val picks = ask(taste, stored.picks, seed)
+                    // An answer with nothing usable keeps the picks there are.
+                    save(user, if (picks.isEmpty()) load(user).copy(problem = "The AI had nothing usable this time") else AiPicks(picks, System.currentTimeMillis(), model = model, seed = seed))
                 } catch (e: Exception) {
                     save(user, load(user).copy(problem = "Ollama: ${e.message ?: e.javaClass.simpleName}"))
                 } finally {
@@ -120,9 +126,10 @@ class Recommendations(
     }
 
     /** Asks the model, and keeps what's new to the library. */
-    fun ask(taste: Taste, before: List<AiPick>): List<AiPick> {
+    fun ask(taste: Taste, before: List<AiPick>, seed: String? = null): List<AiPick> {
         val prompt = buildString {
             appendLine("Suggest 20 albums this listener would probably love but doesn't have yet.")
+            if (seed != null) appendLine("Right now they want more like $seed: stay close to its sound and mood, using their taste below only as a guide.")
             appendLine("Every album must be by an artist who is NOT in their library, must really exist, and the artists should vary.")
             appendLine("Mix a few safe bets with some less obvious finds. For each, give the year and one short sentence on why it fits.")
             if (taste.mostPlayed.isNotEmpty()) appendLine("\nMost played albums:\n" + taste.mostPlayed.joinToString("\n"))
@@ -155,8 +162,10 @@ class Recommendations(
                 .takeIf { it.artist.isNotEmpty() && it.album.isNotEmpty() }
         }
         val earlier = before.map { normalize(it.artist) + "|" + normalize(it.album) }.toSet()
-        return picks.filter { normalize(it.artist) !in taste.library && normalize(it.artist) + "|" + normalize(it.album) !in earlier }
-            .distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
+        val usable = picks.filter { normalize(it.artist) !in taste.library }.distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
+        val (repeats, new) = usable.partition { normalize(it.artist) + "|" + normalize(it.album) in earlier }
+        // Small models repeat themselves; earlier picks only come back when there aren't enough new ones.
+        return (if (new.size >= MIN_NEW) new else new + repeats)
             .asSequence()
             .mapNotNull { pick ->
                 val check = check ?: return@mapNotNull pick
@@ -197,6 +206,7 @@ class Recommendations(
 
     companion object {
         private const val MAX_AGE_MS = 7L * 24 * 3_600_000
+        private const val MIN_NEW = 3
 
         /** Ollama's structured output: the answer has to fit this. */
         private val SCHEMA = buildJsonObject {

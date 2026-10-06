@@ -148,7 +148,8 @@ class TonearmServer(
             }
             "recommendations" -> {
                 val engine = recommendations ?: return error(exchange, 404, "This Tonearm server has no Ollama set up")
-                engine.toJson(engine.get(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true"))
+                val seed = query["seed"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() }
+                engine.toJson(engine.get(user, NavidromeAuth.loginOf(query), refresh = query["refresh"] == "true", seed = seed))
             }
             else -> return error(exchange, 404, "Unknown op")
         }
