@@ -49,7 +49,9 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    AI_URL=http://192.168.1.11:11435
    ```
 
-   For another AI, see [Choosing the AI](#choosing-the-ai).
+   For another AI, see [Choosing the AI](#choosing-the-ai). Everything in the `.env` box reaches the server as it
+   is; with a compose file from before 1.5.3, which listed each setting, only the listed ones did, so take the
+   new one.
 6. Click **Deploy**. The log lists what's set up:
    `Tonearm server 1.5.0 on port 8790 …`, then a line each for Lidarr, the AI and discovery.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
