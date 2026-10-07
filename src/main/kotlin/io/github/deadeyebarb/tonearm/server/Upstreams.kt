@@ -171,28 +171,3 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
         private val COMMANDS = setOf("AlbumSearch", "ArtistSearch")
     }
 }
-
-/**
- * Maloja holds one person's listening history, so it's only for the users named in MALOJA_USERS
- * (or, without that list, Navidrome's admins). Its key is added here.
- */
-class MalojaProxy(private val maloja: Upstream, private val key: String, private val users: Set<String>) {
-    private val json = Json { ignoreUnknownKeys = true }
-
-    fun available(user: String, admin: Boolean) = if (users.isEmpty()) admin else user in users
-
-    fun handle(call: ProxyCall, user: String, admin: Boolean): ProxyAnswer {
-        if (!validPath(PATH, call.path)) return Upstream.error(404, "Not a Maloja API path")
-        if (!available(user, admin)) return Upstream.error(403, "Maloja here isn't shared with this user")
-        if (call.method != "GET" && call.method != "POST") return Upstream.error(405, "Maloja takes GET and POST")
-        // Scrobbles carry the key in their JSON.
-        val body = runCatching { json.parseToJsonElement(call.body.decodeToString()).jsonObject }.getOrNull()
-            ?.let { JsonObject(it + ("key" to JsonPrimitive(key))).toString().encodeToByteArray() }
-            ?: call.body
-        return maloja.send(call, extraQuery = listOf("key" to key), body = body)
-    }
-
-    companion object {
-        val PATH = Regex("^apis/mlj_1/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
-    }
-}

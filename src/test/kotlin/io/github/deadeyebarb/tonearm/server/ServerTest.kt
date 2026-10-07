@@ -21,11 +21,12 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
  * The whole server against a fake Navidrome that knows alice (password "wonderland", an admin) and bob
- * (API key "bobkey"), and a fake Lidarr and Maloja that record what reaches them.
+ * (API key "bobkey"), a fake Lidarr that records what reaches it, and a Maloja to bring alice's history from.
  */
 class ServerTest {
     private lateinit var navidrome: HttpServer
@@ -33,8 +34,10 @@ class ServerTest {
     private val http = HttpClient.newHttpClient()
     private var navidromeCalls = 0
     private lateinit var upstream: HttpServer
-    /** What reached the fake Lidarr/Maloja: method, path?query, X-Api-Key, body. */
+    /** What reached the fake Lidarr: method, path?query, X-Api-Key, body. */
     private val received = mutableListOf<List<String?>>()
+    private lateinit var dataDir: java.io.File
+    private lateinit var history: History
 
     @BeforeTest
     fun start() {
@@ -61,10 +64,13 @@ class ServerTest {
         upstream = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex ->
                 val body = ex.requestBody.readAllBytes().decodeToString()
-                synchronized(received) {
+                if (!ex.requestURI.path.startsWith("/apis/")) synchronized(received) {
                     received += listOf(ex.requestMethod, ex.requestURI.rawPath + (ex.requestURI.rawQuery?.let { "?$it" } ?: ""), ex.requestHeaders.getFirst("X-Api-Key"), body)
                 }
                 val (type, bytes) = when (ex.requestURI.path) {
+                    "/apis/mlj_1/scrobbles" -> "application/json" to """{"status":"ok","list":[
+                        {"time":1759600000,"track":{"artists":["Sia","Diplo"],"title":"Rewrite","album":{"albumtitle":"Rewrite"},"length":200},"duration":200},
+                        {"time":1759600300,"track":{"artists":["Kongos"],"title":"Come with Me Now","length":210},"duration":null}]}""".encodeToByteArray()
                     "/api/v1/rootfolder" -> "application/json" to """[{"path":"/music/"}]""".encodeToByteArray()
                     "/api/v1/mediacover/artist/1/poster-250.jpg" -> "image/jpeg" to byteArrayOf(1, 2, 3)
                     else -> "application/json" to """{"ok":true}""".encodeToByteArray()
@@ -77,10 +83,13 @@ class ServerTest {
             start()
         }
         val up = "http://127.0.0.1:${upstream.address.port}"
+        dataDir = Files.createTempDirectory("tonearm-server").toFile()
+        history = History(dataDir)
         server = TonearmServer(
-            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), Files.createTempDirectory("tonearm-server").toFile(), "test",
+            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test",
             LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), requestsForEveryone = true),
-            MalojaProxy(Upstream("Maloja", up, null, "maloja-secret"), "maloja-secret", emptySet()),
+            history = history,
+            malojaImport = { user, admin -> if (admin) history.importMaloja(user, up, "maloja-secret", http) },
         ).start()
     }
 
@@ -197,12 +206,12 @@ class ServerTest {
         assertEquals("true", alice["admin"]!!.jsonPrimitive.content)
         assertEquals("true", alice["lidarr"]!!.jsonPrimitive.content)
         assertEquals("true", alice["lidarrAdmin"]!!.jsonPrimitive.content)
-        assertEquals("true", alice["maloja"]!!.jsonPrimitive.content)
+        assertEquals("true", alice["history"]!!.jsonPrimitive.content)
+        assertEquals(null, alice["ai"])
         val bob = api("hello", bob)
         assertEquals("false", bob["admin"]!!.jsonPrimitive.content)
         assertEquals("true", bob["lidarr"]!!.jsonPrimitive.content)
         assertEquals("false", bob["lidarrAdmin"]!!.jsonPrimitive.content)
-        assertEquals("false", bob["maloja"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -267,12 +276,48 @@ class ServerTest {
     }
 
     @Test
-    fun malojaGetsItsKeyAndIsOnlyForItsUsers() {
-        assertEquals(200, call("/connect-tonearm/maloja/apis/mlj_1/charts/artists", alice() + listOf("max" to 5), method = "GET").first)
-        assertTrue(received.last()[1]!!.endsWith("?max=5&key=maloja-secret"))
-        assertEquals(200, call("/connect-tonearm/maloja/apis/mlj_1/newscrobble", alice(), """{"artists":["a"],"title":"b","key":""}""").first)
-        assertEquals("maloja-secret", Json.parseToJsonElement(received.last()[3]!!).jsonObject["key"]!!.jsonPrimitive.content)
-        assertEquals(403, call("/connect-tonearm/maloja/apis/mlj_1/charts/artists", bob, method = "GET").first)
+    fun playsGoIntoTheHistoryOnceAndComeBackAsListening() {
+        val now = System.currentTimeMillis()
+        val plays = """[
+            {"at":${now - 60_000},"artist":"Kongos","title":"Come with Me Now","durationMs":210000,"listenedMs":210000,"source":"youtube"},
+            {"at":${now - 30_000},"artist":"Kongos","title":"I'm Only Joking","durationMs":200000,"listenedMs":4000,"source":"youtube"},
+            {"at":${now - 10_000},"artist":"Portishead feat. Someone","title":"Roads","durationMs":300000,"listenedMs":250000}]"""
+        assertEquals(3, api("played", bob, body = plays)["added"]!!.jsonPrimitive.content.toInt())
+        // An app sending them again (it didn't hear back) adds nothing.
+        assertEquals(0, api("played", bob, body = plays)["added"]!!.jsonPrimitive.content.toInt())
+        val listening = api("listening", bob, listOf("days" to 30, "songs" to 5, "recent" to 5))
+        assertEquals(2, listening["plays"]!!.jsonPrimitive.content.toInt())
+        val artists = listening["artists"]!!.jsonArray.map { it.jsonObject }
+        // As many plays each: the latest first. Kongos' second song was a skip.
+        assertEquals(listOf("Portishead", "Kongos"), artists.map { it["artist"]!!.jsonPrimitive.content })
+        assertEquals("1", artists.last()["skips"]!!.jsonPrimitive.content)
+        assertEquals("Roads", listening["recent"]!!.jsonArray.first().jsonObject["title"]!!.jsonPrimitive.content)
+        assertEquals(400, call("/connect-tonearm/api/played", bob, "not a list").first)
+    }
+
+    @Test
+    fun saidNoStaysUntilTheyPlayThemAgain() {
+        api("dismiss", bob, listOf("artist" to "Mazzy Star"))
+        assertTrue(history.isDismissed("bob", "mazzy star"))
+        assertTrue(history.isDismissed("bob", "Mazzy Star", "So Tonight That I Might See"))
+        val now = System.currentTimeMillis()
+        api("played", bob, body = (1..3).joinToString(",", "[", "]") { """{"at":${now + it},"artist":"Mazzy Star","title":"Fade Into You $it","durationMs":290000,"listenedMs":290000}""" })
+        assertFalse(history.isDismissed("bob", "Mazzy Star"))
+        api("dismiss", bob, listOf("artist" to "Tricky", "album" to "Maxinquaye"))
+        assertTrue(history.isDismissed("bob", "Tricky", "Maxinquaye (Deluxe Edition)"))
+        assertFalse(history.isDismissed("bob", "Tricky", "Pre-Millennium Tension"))
+        assertEquals(400, call("/connect-tonearm/api/dismiss", bob).first)
+    }
+
+    @Test
+    fun malojasHistoryComesOverOnceForAnAdmin() {
+        api("hello", bob)
+        assertTrue(history.isEmpty("bob"))
+        api("hello", alice())
+        val listening = history.listening("alice", 0, artists = 10, songs = 10, recent = 10)
+        assertEquals(listOf("Sia", "Kongos"), listening.artists.map { it.artist }.sorted().reversed())
+        assertEquals("Rewrite", listening.songs.first { it.artist == "Sia" }.album)
+        assertEquals(null, history.importMaloja("alice", "http://127.0.0.1:${upstream.address.port}", null, http))
     }
 
     @Test

@@ -30,6 +30,8 @@ data class DiscoveryPick(
     val coverUrl: String? = null,
     /** The user's artists that led here, most telling first. */
     val because: List<String> = emptyList(),
+    /** Why, when it isn't [because] ("Played 5 times on YouTube Music lately"). */
+    val reason: String? = null,
 )
 
 @Serializable
@@ -60,6 +62,8 @@ class Discovery(
     dataDir: File,
     private val deezer: String = "https://api.deezer.com",
     private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
+    /** What the apps played, skipped and said no to, for seeds that follow the listening. */
+    private val history: History? = null,
 ) {
     private val dir = File(dataDir, "discovery").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -78,7 +82,7 @@ class Discovery(
         if (due && running.add(user)) {
             worker.execute {
                 try {
-                    val made = DiscoveryPicks(make(login), System.currentTimeMillis())
+                    val made = DiscoveryPicks(make(user, login), System.currentTimeMillis())
                     save(user, if (made.picks.isEmpty() && stored.picks.isNotEmpty()) stored.copy(madeAt = made.madeAt, problem = "Nothing new to discover this time") else made)
                 } catch (e: Exception) {
                     save(user, load(user).copy(problem = "Discovery: ${e.message ?: e.javaClass.simpleName}"))
@@ -87,7 +91,7 @@ class Discovery(
                 }
             }
         }
-        return load(user).copy(running = user in running)
+        return load(user).let { it.copy(picks = it.picks.filter { p -> history?.isDismissed(user, p.artist) != true }, running = user in running) }
     }
 
     /** Artists like [artist] (by name), marked when the user's library has them. */
@@ -124,10 +128,28 @@ class Discovery(
 
     fun toJson(search: WebSearch): JsonObject = json.encodeToJsonElement(WebSearch.serializer(), search).jsonObject
 
-    private fun make(login: Map<String, String>): List<DiscoveryPick> {
+    private fun make(user: String, login: Map<String, String>): List<DiscoveryPick> {
         val library = library(login)
-        val seeds = seeds(login)
-        if (seeds.isEmpty()) return emptyList()
+        val seeds = seeds(user, login)
+        val dismissed = history?.dismissed(user).orEmpty().filter { it.album == null }.map { normalize(it.artist) }.toSet()
+        val since = System.currentTimeMillis() - 60 * DAY_MS
+        // Artists played again and again without being in the library: the plainest picks of all.
+        val outside = history?.listening(user, since, artists = 200, songs = 0, recent = 0)?.artists.orEmpty()
+            .filter { it.plays >= 3 && normalize(it.artist) !in library && normalize(it.artist) !in dismissed }
+            .take(OUTSIDE)
+            .map { counted -> counted to pool.submit<Pair<JsonObject?, JsonObject?>> { findArtist(counted.artist)?.let { it to bestAlbum(it.long("id")) } ?: (null to null) } }
+            .mapNotNull { (counted, future) ->
+                val (artist, album) = runCatching { future.get() }.getOrNull() ?: (null to null)
+                DiscoveryPick(
+                    artist = artist?.str("name")?.ifEmpty { null } ?: counted.artist,
+                    album = album?.str("title")?.ifEmpty { null },
+                    year = album?.str("release_date")?.take(4)?.toIntOrNull(),
+                    imageUrl = artist?.str("picture_medium")?.ifEmpty { null },
+                    coverUrl = album?.str("cover_medium")?.ifEmpty { null },
+                    reason = "You've played them ${counted.plays} times lately, and the library doesn't have them yet",
+                )
+            }
+        if (seeds.isEmpty()) return outside
         // Each seed's related artists, in parallel (Deezer allows 50 calls per 5 s).
         val related = seeds.map { (name, weight) -> Triple(name, weight, pool.submit<List<JsonObject>> { findArtist(name)?.let { related(it.long("id")) }.orEmpty() }) }
         val scores = HashMap<String, Double>()
@@ -137,16 +159,16 @@ class Discovery(
         for ((seed, weight, future) in related) {
             for ((i, artist) in runCatching { future.get() }.getOrDefault(emptyList()).withIndex()) {
                 val key = normalize(artist.str("name"))
-                if (key.isEmpty() || key in library || key in seedKeys) continue
+                if (key.isEmpty() || key in library || key in seedKeys || key in dismissed || outside.any { normalize(it.artist) == key }) continue
                 val score = weight * (1.0 - i / 25.0)
                 scores.merge(key, score, Double::plus)
                 names.putIfAbsent(key, artist)
                 reasons.getOrPut(key) { HashMap() }.merge(seed, score, Double::plus)
             }
         }
-        val top = scores.entries.sortedByDescending { it.value }.take(PICKS).map { it.key }
+        val top = scores.entries.sortedByDescending { it.value }.take(PICKS - outside.size).map { it.key }
         val albums = top.associateWith { key -> pool.submit<JsonObject?> { bestAlbum(names.getValue(key).long("id")) } }
-        return top.map { key ->
+        return outside + top.map { key ->
             val artist = names.getValue(key)
             val album = runCatching { albums.getValue(key).get() }.getOrNull()
             DiscoveryPick(
@@ -160,8 +182,11 @@ class Discovery(
         }
     }
 
-    /** The user's artists with a weight: liked ones count most, then what's played most, then lately. */
-    private fun seeds(login: Map<String, String>): List<Pair<String, Double>> {
+    /**
+     * The user's artists with a weight: liked ones count most, then what's played most, then lately, with what
+     * the apps played in the last two months (YouTube Music too) on top and mostly skipped ones dropped.
+     */
+    private fun seeds(user: String, login: Map<String, String>): List<Pair<String, Double>> {
         val weights = LinkedHashMap<String, Pair<String, Double>>()
         fun add(name: String, weight: Double) {
             if (name.isBlank()) return
@@ -176,7 +201,10 @@ class Discovery(
         starred?.get("artist")?.jsonArray.orEmpty().forEach { add(it.jsonObject.str("name"), 3.0) }
         starred?.get("album")?.jsonArray.orEmpty().forEach { add(it.jsonObject.str("artist"), 1.5) }
         starred?.get("song")?.jsonArray.orEmpty().forEach { add(it.jsonObject.str("artist"), 0.5) }
-        return weights.values.sortedByDescending { it.second }.take(SEEDS)
+        history?.listening(user, System.currentTimeMillis() - 60 * DAY_MS, artists = 100, songs = 0, recent = 0)?.artists.orEmpty().forEach { counted ->
+            add(counted.artist, 0.4 * minOf(counted.plays, 8) - if (counted.skips > 2 * counted.plays) 1.5 else 0.0)
+        }
+        return weights.values.filter { it.second > 0 }.sortedByDescending { it.second }.take(SEEDS)
     }
 
     private fun library(login: Map<String, String>): Set<String> =
@@ -242,11 +270,14 @@ class Discovery(
     )
 
     companion object {
+        private const val DAY_MS = 24 * 3_600_000L
         private const val MAX_AGE_MS = 24 * 3_600_000L
         private const val CACHE_MS = 7 * 24 * 3_600_000L
         private const val LIBRARY_MS = 10 * 60_000L
         private const val SEEDS = 15
         private const val PICKS = 16
+        /** At most this many picks are artists already played elsewhere. */
+        private const val OUTSIDE = 4
         private val LIVE = Regex("""\b(live|remaster(ed)?|deluxe|anniversary|demo)\b""", RegexOption.IGNORE_CASE)
 
         private fun normalize(text: String) = Recommendations.normalize(text)

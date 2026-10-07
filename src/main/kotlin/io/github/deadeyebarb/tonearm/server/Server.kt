@@ -2,6 +2,8 @@ package io.github.deadeyebarb.tonearm.server
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -18,7 +20,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The Tonearm server's HTTP side. Everything lives under [basePath] (where the proxy sends it):
- * `api/<op>` for Connect, `lidarr/…` and `maloja/…` for those services with the server's keys,
+ * `api/<op>` for Connect, picks and listening history, `lidarr/…` for Lidarr with the server's key,
  * `health` for Docker, and a short status text at the root.
  */
 class TonearmServer(
@@ -28,11 +30,14 @@ class TonearmServer(
     dataDir: File,
     private val version: String,
     private val lidarr: LidarrProxy? = null,
-    private val maloja: MalojaProxy? = null,
     private val recommendations: Recommendations? = null,
     private val discovery: Discovery? = null,
+    private val history: History = History(dataDir),
+    /** Brings a Maloja's history over once, for the first user it's meant for. */
+    private val malojaImport: ((user: String, admin: Boolean) -> Unit)? = null,
 ) {
     private val base = "/" + basePath.trim('/')
+    private val json = Json { ignoreUnknownKeys = true }
     private val hub = Hub()
     private val store = Store(File(dataDir, "store"))
     private lateinit var http: HttpServer
@@ -68,7 +73,7 @@ class TonearmServer(
         when {
             path == "health" -> return text(exchange, 200, "ok")
             path.isEmpty() -> return text(exchange, 200, "Tonearm server $version is running. The Tonearm apps use it at $base/api/.")
-            !path.startsWith("api/") && !path.startsWith("lidarr/") && !path.startsWith("maloja/") -> return text(exchange, 404, "Not found")
+            !path.startsWith("api/") && !path.startsWith("lidarr/") -> return text(exchange, 404, "Not found")
         }
         val query = parseQuery(exchange.requestURI.rawQuery)
         val client = exchange.requestHeaders.getFirst("X-Real-IP") ?: exchange.requestHeaders.getFirst("X-Forwarded-For")?.substringBefore(',')?.trim()
@@ -81,15 +86,12 @@ class TonearmServer(
             is NavidromeAuth.Result.Unreachable -> return error(exchange, 502, result.message)
         }
         val user = login.user
+        malojaImport?.invoke(user, login.admin)
         val bytes = exchange.requestBody.use { it.readNBytes(MAX_PAYLOAD + 1) }
         if (bytes.size > MAX_PAYLOAD) return error(exchange, 413, "Payload too large")
         if (!path.startsWith("api/")) {
             val call = ProxyCall(exchange.requestMethod.uppercase(), path.substringAfter('/'), exchange.requestURI.rawQuery, exchange.requestHeaders.getFirst("Content-Type"), bytes)
-            val answer = when {
-                path.startsWith("lidarr/") -> lidarr?.handle(call, login.admin) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up")
-                else -> maloja?.handle(call, user, login.admin) ?: Upstream.error(404, "This Tonearm server has no Maloja set up")
-            }
-            return relay(exchange, answer)
+            return relay(exchange, lidarr?.handle(call, login.admin) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up"))
         }
         val op = path.removePrefix("api/")
         val payload = bytes.decodeToString()
@@ -104,9 +106,10 @@ class TonearmServer(
                 put("admin", login.admin)
                 put("lidarr", lidarr?.available(login.admin) == true)
                 put("lidarrAdmin", lidarr != null && login.admin)
-                put("maloja", maloja?.available(user, login.admin) == true)
                 put("recommendations", recommendations != null)
                 put("discovery", discovery != null)
+                put("history", true)
+                recommendations?.let { put("ai", it.label) }
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")
@@ -191,6 +194,26 @@ class TonearmServer(
                     return error(exchange, 502, "Couldn't look up similar artists: ${e.message}")
                 }
                 engine.toJson(name, similar)
+            }
+            "played" -> {
+                val plays = try {
+                    json.decodeFromString(ListSerializer(Played.serializer()), payload)
+                } catch (e: Exception) {
+                    return error(exchange, 400, "payload has to be a list of plays")
+                }
+                if (plays.size > 1_000) return error(exchange, 413, "At most 1000 plays at once")
+                buildJsonObject { put("ok", true); put("added", history.add(user, plays)) }
+            }
+            "listening" -> {
+                val days = query["days"]?.toLongOrNull()?.takeIf { it > 0 }
+                val since = days?.let { System.currentTimeMillis() - it * 24 * 3_600_000L } ?: 0
+                fun limit(name: String, default: Int) = (query[name]?.toIntOrNull() ?: default).coerceIn(0, 1_000)
+                history.toJson(history.listening(user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0)))
+            }
+            "dismiss" -> {
+                val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
+                history.dismiss(user, artist, query["album"]?.trim()?.take(300))
+                buildJsonObject { put("ok", true) }
             }
             else -> return error(exchange, 404, "Unknown op")
         }

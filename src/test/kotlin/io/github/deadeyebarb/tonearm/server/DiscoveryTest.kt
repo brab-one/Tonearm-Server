@@ -98,6 +98,23 @@ class DiscoveryTest {
     }
 
     @Test
+    fun artistsPlayedElsewhereComeFirstAndSaidNoNeverComes() {
+        val url = "http://127.0.0.1:${fake.address.port}"
+        val history = History(Files.createTempDirectory("tonearm-history").toFile())
+        val now = System.currentTimeMillis()
+        history.add("alice", (1..3).map { Played(now - it * 60_000L, "Kongos", "Song $it", durationMs = 200_000, listenedMs = 200_000, source = "youtube") })
+        history.dismiss("alice", "Muse", null)
+        val withHistory = Discovery(url, Files.createTempDirectory("tonearm-discovery").toFile(), deezer = "$url/deezer", history = history)
+        var made = withHistory.picks("alice", login, refresh = false)
+        while (made.running) { Thread.sleep(20); made = withHistory.picks("alice", login, refresh = false) }
+        assertEquals(listOf("Kongos", "Björk", "Tricky", "Air"), made.picks.map { it.artist })
+        assertTrue(made.picks.first().reason!!.startsWith("You've played them 3 times"))
+        // Saying no later takes them out of the picks already made.
+        history.dismiss("alice", "Tricky", null)
+        assertEquals(listOf("Kongos", "Björk", "Air"), withHistory.picks("alice", login, refresh = false).picks.map { it.artist })
+    }
+
+    @Test
     fun picksAreKeptForADay() {
         picks()
         val calls = deezerCalls

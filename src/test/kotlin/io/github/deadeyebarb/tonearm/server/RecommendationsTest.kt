@@ -57,7 +57,7 @@ class RecommendationsTest {
             start()
         }
         val url = "http://127.0.0.1:${fake.address.port}"
-        engine = Recommendations(url, "qwen2.5", url, Files.createTempDirectory("tonearm-recs").toFile())
+        engine = Recommendations(OllamaAi(url, "qwen2.5"), url, Files.createTempDirectory("tonearm-recs").toFile())
     }
 
     @AfterTest
@@ -67,7 +67,7 @@ class RecommendationsTest {
 
     @Test
     fun theTasteComesFromTheUsersOwnListening() {
-        val taste = engine.taste(login)
+        val taste = engine.taste("alice", login)
         assertEquals(listOf("Radiohead – OK Computer"), taste.mostPlayed)
         assertEquals(listOf("Portishead – Dummy"), taste.recent)
         assertEquals(listOf("Massive Attack", "Björk – Jóga"), taste.liked)
@@ -77,7 +77,7 @@ class RecommendationsTest {
     @Test
     fun suggestionsLeaveOutTheLibraryAndRepeats() {
         // Only one new one, so the earlier pick comes back after it.
-        val picks = engine.ask(engine.taste(login), before = listOf(AiPick("Tricky", "Maxinquaye")))
+        val picks = engine.ask(engine.taste("alice", login), before = listOf(AiPick("Tricky", "Maxinquaye")))
         assertEquals(listOf("Mazzy Star", "Tricky"), picks.map { it.artist })
         val request = Json.parseToJsonElement(asked!!).jsonObject
         assertEquals("qwen2.5", request["model"]!!.jsonPrimitive.content)
@@ -88,23 +88,39 @@ class RecommendationsTest {
 
     @Test
     fun aSeedAsksForMoreLikeIt() {
-        engine.ask(engine.taste(login), before = emptyList(), seed = "the album “Dummy” by Portishead")
+        engine.ask(engine.taste("alice", login), before = emptyList(), seed = "the album “Dummy” by Portishead")
         assertTrue("more like the album “Dummy” by Portishead" in Json.parseToJsonElement(asked!!).toString().replace("\\u201c", "“").replace("\\u201d", "”"))
+    }
+
+    @Test
+    fun whatTheAppsPlayedAndWhatTheySaidNoToShapeThePicks() {
+        val url = "http://127.0.0.1:${fake.address.port}"
+        val history = History(Files.createTempDirectory("tonearm-history").toFile())
+        val now = System.currentTimeMillis()
+        history.add("alice", (1..4).map { Played(now - it * 60_000L, "Sia", "Song $it", durationMs = 200_000, listenedMs = 200_000, source = "youtube") } +
+            (1..2).map { Played(now - 600_000L - it, "Portishead", "Roads $it", durationMs = 300_000, listenedMs = 300_000) })
+        history.dismiss("alice", "Mazzy Star", null)
+        val engine = Recommendations(OllamaAi(url, "qwen2.5"), url, Files.createTempDirectory("tonearm-recs").toFile(), history = history)
+        assertEquals(listOf("Tricky"), engine.ask(engine.taste("alice", login), before = emptyList()).map { it.artist })
+        assertTrue("Sia (4) *" in asked!!)
+        assertTrue("Portishead (2)" in asked!! && "Portishead (2) *" !in asked!!)
+        assertTrue("Mazzy Star (anything by them)" in asked!!)
+        assertEquals("Ollama qwen2.5", engine.label)
     }
 
     @Test
     fun madeUpAlbumsAreDroppedWhenLidarrCanTell() {
         val url = "http://127.0.0.1:${fake.address.port}"
-        val checked = Recommendations(url, "qwen2.5", url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { pick ->
+        val checked = Recommendations(OllamaAi(url, "qwen2.5"), url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { pick ->
             when (pick.artist) {
                 "Mazzy Star" -> pick.copy(album = "So Tonight That I Might See", year = 1993)
                 "Tricky" -> null
                 else -> error("Lidarr's search failed")
             }
         })
-        assertEquals(listOf("Mazzy Star"), checked.ask(checked.taste(login), before = emptyList()).map { it.artist })
-        val unsure = Recommendations(url, "qwen2.5", url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { error("Lidarr's search failed") })
-        assertEquals(listOf("Mazzy Star", "Tricky"), unsure.ask(unsure.taste(login), before = emptyList()).map { it.artist })
+        assertEquals(listOf("Mazzy Star"), checked.ask(checked.taste("alice", login), before = emptyList()).map { it.artist })
+        val unsure = Recommendations(OllamaAi(url, "qwen2.5"), url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { error("Lidarr's search failed") })
+        assertEquals(listOf("Mazzy Star", "Tricky"), unsure.ask(unsure.taste("alice", login), before = emptyList()).map { it.artist })
         assertEquals(Recommendations.bareTitle("OK Computer"), Recommendations.bareTitle("OK Computer (Collector's Edition) [Remastered]"))
     }
 

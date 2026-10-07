@@ -12,7 +12,6 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.io.File
 import java.net.URI
@@ -59,29 +58,42 @@ data class AiHit(val artist: String, val title: String? = null, val album: Strin
 @Serializable
 data class AiSearch(val query: String, val hits: List<AiHit> = emptyList(), val running: Boolean = false, val problem: String? = null)
 
-/** What a user listens to, as Navidrome knows it. */
+/** What a user listens to: as Navidrome knows it, and from what the apps played (YouTube Music too). */
 data class Taste(
     val mostPlayed: List<String>,
     val recent: List<String>,
     val liked: List<String>,
     /** Every artist in the library, to leave out of the suggestions. */
     val library: Set<String>,
+    /** The last month's artists with their plays, also ones not in the library. */
+    val lately: List<ArtistCount> = emptyList(),
+    /** Artists mostly skipped lately. */
+    val skipped: List<String> = emptyList(),
+    /** What they said no to. */
+    val dismissed: List<Dismissed> = emptyList(),
+    /** Earlier suggestions they went on to play. */
+    val tookTo: List<String> = emptyList(),
 )
 
 /**
- * Album suggestions from Ollama, made per user from what that user plays and likes on Navidrome (asked as
- * them, with their own login, while their request is open). The picks are kept in DATA_DIR and renewed
- * when they're a week old or the user asks.
+ * Album suggestions from an [Ai], made per user from what that user plays and likes on Navidrome (asked as
+ * them, with their own login, while their request is open) and what the apps told [history] they played,
+ * skipped and didn't want. The picks are kept in DATA_DIR and renewed when they're a week old or the user asks.
  */
 class Recommendations(
-    private val ollamaUrl: String,
-    private val model: String,
+    private val ai: Ai,
     private val navidromeUrl: String,
     dataDir: File,
     /** Weeds out albums the model made up; without it every suggestion is kept. */
     private val check: AlbumCheck? = null,
+    private val history: History? = null,
     private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
 ) {
+    private val model get() = ai.model
+
+    /** Which AI answers, for the apps ("Claude claude-opus-5-5"). */
+    val label: String get() = (if (ai.name == "The AI") "" else ai.name + " ") + ai.model
+
     private val dir = File(dataDir, "recommendations").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val running = ConcurrentHashMap.newKeySet<String>()
@@ -99,7 +111,7 @@ class Recommendations(
         val due = refresh || seed != null || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt > MAX_AGE_MS
         if (due && running.add(user)) {
             val taste = try {
-                taste(login)
+                taste(user, login)
             } catch (e: Exception) {
                 running.remove(user)
                 return stored.copy(problem = "Couldn't read your listening from Navidrome: ${e.message}")
@@ -107,16 +119,17 @@ class Recommendations(
             worker.execute {
                 try {
                     val picks = ask(taste, stored.picks, seed)
+                        .filter { history?.isDismissed(user, it.artist, it.album) != true }
                     // An answer with nothing usable keeps the picks there are.
                     save(user, if (picks.isEmpty()) load(user).copy(problem = "The AI had nothing usable this time") else AiPicks(picks, System.currentTimeMillis(), model = model, seed = seed))
                 } catch (e: Exception) {
-                    save(user, load(user).copy(problem = "Ollama: ${e.message ?: e.javaClass.simpleName}"))
+                    save(user, load(user).copy(problem = "${ai.name}: ${e.message ?: e.javaClass.simpleName}"))
                 } finally {
                     running.remove(user)
                 }
             }
         }
-        return load(user).copy(running = user in running, model = model)
+        return load(user).let { it.copy(picks = it.picks.filter { p -> history?.isDismissed(user, p.artist, p.album) != true }, running = user in running, model = model) }
     }
 
     /**
@@ -134,7 +147,7 @@ class Recommendations(
             val done = try {
                 AiSearch(query, askSearch(query))
             } catch (e: Exception) {
-                AiSearch(query, problem = "Ollama: ${e.message ?: e.javaClass.simpleName}")
+                AiSearch(query, problem = "${ai.name}: ${e.message ?: e.javaClass.simpleName}")
             }
             searches[key] = done to System.currentTimeMillis()
         }
@@ -165,7 +178,7 @@ class Recommendations(
             }
             put("required", JsonArray(listOf(JsonPrimitive("results"))))
         }
-        val content = chat(prompt, schema, temperature = 0.3)
+        val content = ai.json(SYSTEM, prompt, schema, temperature = 0.3)
         return json.parseToJsonElement(content).jsonObject["results"]?.jsonArray.orEmpty().mapNotNull { element ->
             val o = element as? JsonObject ?: return@mapNotNull null
             val hit = AiHit(o.str("artist").trim(), o.str("title").trim().ifEmpty { null }, o.str("album").trim().ifEmpty { null }, o.str("why").trim())
@@ -175,8 +188,8 @@ class Recommendations(
 
     fun toJson(search: AiSearch): JsonObject = json.encodeToJsonElement(AiSearch.serializer(), search).jsonObject
 
-    /** Reads the user's listening from Navidrome with their login. */
-    fun taste(login: Map<String, String>): Taste {
+    /** Reads the user's listening from Navidrome with their login, and from what the apps played. */
+    fun taste(user: String, login: Map<String, String>): Taste {
         fun albums(type: String, size: Int) = subsonic("getAlbumList2", login + mapOf("type" to type, "size" to "$size"))["albumList2"]
             ?.jsonObject?.get("album")?.jsonArray.orEmpty().map { it.jsonObject }
         fun label(album: JsonObject) = "${album.str("artist")} – ${album.str("name")}"
@@ -188,7 +201,22 @@ class Recommendations(
         }
         val library = subsonic("getArtists", login)["artists"]?.jsonObject?.get("index")?.jsonArray.orEmpty()
             .flatMap { it.jsonObject["artist"]?.jsonArray.orEmpty() }.map { normalize(it.jsonObject.str("name")) }.toSet()
-        return Taste(albums("frequent", 40).map(::label), albums("recent", 25).map(::label), liked.distinct().take(80), library)
+        val now = System.currentTimeMillis()
+        val lately = history?.listening(user, now - 30 * DAY_MS, artists = 30, songs = 0, recent = 0)?.artists.orEmpty()
+        val quarter = history?.listening(user, now - 90 * DAY_MS, artists = 500, songs = 0, recent = 0)?.artists.orEmpty()
+        val played = history?.played(user).orEmpty()
+        val earlier = load(user)
+        val tookTo = earlier.picks.filter { pick ->
+            played.count { it.counts && it.at > earlier.madeAt && normalize(it.mainArtist) == normalize(pick.artist) } >= 2
+        }.map { "${it.artist} – ${it.album}" }
+        // Skips only say something next to few plays: everyone skips their favourites now and then.
+        val skippers = played.filter { it.at > now - 90 * DAY_MS && it.skipped }.groupingBy { it.mainArtist }.eachCount()
+            .filter { (artist, skips) -> skips >= 3 && skips > 2 * (quarter.firstOrNull { normalize(it.artist) == normalize(artist) }?.plays ?: 0) }
+            .keys.take(20)
+        return Taste(
+            albums("frequent", 40).map(::label), albums("recent", 25).map(::label), liked.distinct().take(80), library,
+            lately = lately, skipped = skippers.toList(), dismissed = history?.dismissed(user).orEmpty(), tookTo = tookTo,
+        )
     }
 
     /** Asks the model, and keeps what's new to the library. */
@@ -201,16 +229,28 @@ class Recommendations(
             if (taste.mostPlayed.isNotEmpty()) appendLine("\nMost played albums:\n" + taste.mostPlayed.joinToString("\n"))
             if (taste.recent.isNotEmpty()) appendLine("\nPlayed recently:\n" + taste.recent.joinToString("\n"))
             if (taste.liked.isNotEmpty()) appendLine("\nLiked:\n" + taste.liked.joinToString("\n"))
+            if (taste.lately.isNotEmpty()) {
+                appendLine("\nWhat they've played this month, wherever they played it (plays in brackets; * = not in their library, so heard on YouTube Music):")
+                appendLine(taste.lately.joinToString("\n") { "${it.artist} (${it.plays})" + if (normalize(it.artist) in taste.library) "" else " *" })
+            }
+            if (taste.tookTo.isNotEmpty()) appendLine("\nEarlier suggestions they went on to play, so more in this direction works:\n" + taste.tookTo.joinToString("\n"))
+            if (taste.skipped.isNotEmpty()) appendLine("\nArtists they mostly skip, so steer away from their sound:\n" + taste.skipped.joinToString("\n"))
+            if (taste.dismissed.isNotEmpty()) {
+                appendLine("\nThey said no to these; never suggest them:")
+                appendLine(taste.dismissed.joinToString("\n") { d -> d.album?.let { "${d.artist} – $it" } ?: "${d.artist} (anything by them)" })
+            }
             if (before.isNotEmpty()) appendLine("\nAlready suggested before (don't repeat):\n" + before.joinToString("\n") { "${it.artist} – ${it.album}" })
         }
-        val content = chat(prompt, SCHEMA, temperature = 0.8)
+        val content = ai.json(SYSTEM, prompt, SCHEMA, temperature = 0.8)
         val picks = json.parseToJsonElement(content).jsonObject["recommendations"]?.jsonArray.orEmpty().mapNotNull { element ->
             val o = element as? JsonObject ?: return@mapNotNull null
             AiPick(o.str("artist").trim(), o.str("album").trim(), o["year"]?.jsonPrimitive?.contentOrNull?.toIntOrNull(), o.str("why").trim())
                 .takeIf { it.artist.isNotEmpty() && it.album.isNotEmpty() }
         }
         val earlier = before.map { normalize(it.artist) + "|" + normalize(it.album) }.toSet()
-        val usable = picks.filter { normalize(it.artist) !in taste.library }.distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
+        val no = taste.dismissed.filter { it.album == null }.map { normalize(it.artist) }.toSet()
+        val noAlbums = taste.dismissed.mapNotNull { d -> d.album?.let { normalize(d.artist) + "|" + bareTitle(it) } }.toSet()
+        val usable = picks.filter { normalize(it.artist) !in taste.library && normalize(it.artist) !in no && normalize(it.artist) + "|" + bareTitle(it.album) !in noAlbums }.distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
         val (repeats, new) = usable.partition { normalize(it.artist) + "|" + normalize(it.album) in earlier }
         // Small models repeat themselves; earlier picks only come back when there aren't enough new ones.
         return (if (new.size >= MIN_NEW) new else new + repeats)
@@ -222,29 +262,6 @@ class Recommendations(
             .distinctBy { normalize(it.artist) + "|" + normalize(it.album) }
             .take(12)
             .toList()
-    }
-
-    /** One structured answer from the model. */
-    private fun chat(prompt: String, schema: JsonObject, temperature: Double): String {
-        val body = buildJsonObject {
-            put("model", model)
-            put("stream", false)
-            putJsonArray("messages") {
-                add(buildJsonObject { put("role", "system"); put("content", "You are a music critic with deep knowledge of albums across all genres. Answer only with the requested JSON.") })
-                add(buildJsonObject { put("role", "user"); put("content", prompt) })
-            }
-            put("format", schema)
-            putJsonObject("options") { put("temperature", temperature); put("num_ctx", 8192) }
-        }
-        val request = HttpRequest.newBuilder(URI.create(ollamaUrl.trimEnd('/') + "/api/chat"))
-            .timeout(Duration.ofMinutes(15))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-            .build()
-        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
-        if (response.statusCode() !in 200..299) throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(200)}")
-        return json.parseToJsonElement(response.body()).jsonObject["message"]?.jsonObject?.str("content")
-            ?: throw IllegalStateException("no answer")
     }
 
     private fun subsonic(method: String, params: Map<String, String>): JsonObject {
@@ -276,11 +293,13 @@ class Recommendations(
     fun toJson(picks: AiPicks): JsonObject = json.encodeToJsonElement(AiPicks.serializer(), picks).jsonObject
 
     companion object {
+        private const val DAY_MS = 24 * 3_600_000L
         private const val MAX_AGE_MS = 7L * 24 * 3_600_000
+        private const val SYSTEM = "You are a music critic with deep knowledge of albums across all genres. Answer only with the requested JSON."
         private const val MIN_NEW = 3
         private const val SEARCH_MS = 24 * 3_600_000L
 
-        /** Ollama's structured output: the answer has to fit this. */
+        /** The answer has to fit this. */
         private val SCHEMA = buildJsonObject {
             put("type", "object")
             putJsonObject("properties") {

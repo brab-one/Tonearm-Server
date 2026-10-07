@@ -11,9 +11,18 @@ services:
       # Optional, from the stack's .env; leave any out to skip it.
       LIDARR_URL: ${LIDARR_URL:-}
       LIDARR_API_KEY: ${LIDARR_API_KEY:-}
+      # The AI for AI picks: ollama, openai (anything with OpenAI's API) or claude. See the README.
+      AI_PROVIDER: ${AI_PROVIDER:-}
+      AI_URL: ${AI_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      # Still works for Ollama.
+      OLLAMA_URL: ${OLLAMA_URL:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      # Only to bring a Maloja's history over once; remove after.
       MALOJA_URL: ${MALOJA_URL:-}
       MALOJA_API_KEY: ${MALOJA_API_KEY:-}
-      OLLAMA_URL: ${OLLAMA_URL:-}
+      MALOJA_USERS: ${MALOJA_USERS:-}
     ports:
       - "8790:8790"
     volumes:
