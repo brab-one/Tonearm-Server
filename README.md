@@ -56,6 +56,10 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
 
 To update later, open the stack in Dockge and click **Update**.
 
+The log's `Data:` line should say `/data is writable`. If it warns instead, the server can't keep anything
+(picks, history, weekly picks, shared likes). With the compose file as it is (a Docker volume) that doesn't
+happen; if you changed `/data` to a folder on the host, give it to the server's user: `chown -R 1000:1000 <that folder>`.
+
 ### With plain Docker Compose
 
 Put `docker-compose.yml` in a folder, change `NAVIDROME_URL`, put the optional settings in a `.env` next to

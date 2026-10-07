@@ -47,6 +47,8 @@ fun main() {
     println("AI picks and search: " + (ai?.let { "${it.name.takeUnless { n -> n == "The AI" } ?: "OpenAI-style API"} with ${it.model}" } ?: "not set up (AI_PROVIDER)"))
     println("Discovery and similar artists: " + if (discovery != null) "from Deezer" else "off")
     if (malojaImport != null) println("Maloja: its history comes over for the first of ${env("MALOJA_USERS") ?: "Navidrome's admins"} to use the apps, unless it did before")
+    // Everything it keeps lives there; without it Connect still works, but nothing is remembered.
+    DataFiles.unwritable(dataDir)?.let { System.err.println("WARNING: $it") } ?: println("Data: $dataDir is writable")
 }
 
 /**

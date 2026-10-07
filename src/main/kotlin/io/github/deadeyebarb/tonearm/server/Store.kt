@@ -50,15 +50,7 @@ class Store(private val dir: File) {
         }
     }
 
-    private fun save(user: String, entries: Map<String, Entry>) {
-        val f = file(user)
-        val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(serializer, entries))
-        if (!tmp.renameTo(f)) {
-            f.delete()
-            tmp.renameTo(f)
-        }
-    }
+    private fun save(user: String, entries: Map<String, Entry>) = DataFiles.write(file(user), json.encodeToString(serializer, entries))
 
     companion object {
         private val KEY = Regex("^[a-z0-9][a-z0-9-]{0,63}$")

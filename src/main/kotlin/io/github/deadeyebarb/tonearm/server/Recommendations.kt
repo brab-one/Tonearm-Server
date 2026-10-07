@@ -274,17 +274,19 @@ class Recommendations(
     }
 
     @Synchronized
-    private fun load(user: String): AiPicks =
+    private fun load(user: String): AiPicks = unsaved[user] ?:
         runCatching { json.decodeFromString(AiPicks.serializer(), file(user).readText()) }.getOrDefault(AiPicks())
+
+    /** Picks that couldn't be written, kept here with why (shown to the apps) until a write works again. */
+    private val unsaved = ConcurrentHashMap<String, AiPicks>()
 
     @Synchronized
     private fun save(user: String, picks: AiPicks) {
-        val f = file(user)
-        val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(AiPicks.serializer(), picks.copy(running = false)))
-        if (!tmp.renameTo(f)) {
-            f.delete()
-            tmp.renameTo(f)
+        try {
+            DataFiles.write(file(user), json.encodeToString(AiPicks.serializer(), picks.copy(running = false)))
+            unsaved.remove(user)
+        } catch (e: Exception) {
+            unsaved[user] = picks.copy(running = false, problem = e.message)
         }
     }
 

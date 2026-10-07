@@ -247,17 +247,19 @@ class Discovery(
     }
 
     @Synchronized
-    private fun load(user: String): DiscoveryPicks =
+    private fun load(user: String): DiscoveryPicks = unsaved[user] ?:
         runCatching { json.decodeFromString(DiscoveryPicks.serializer(), file(user).readText()) }.getOrDefault(DiscoveryPicks())
+
+    /** Picks that couldn't be written, kept here with why (shown to the apps) until a write works again. */
+    private val unsaved = ConcurrentHashMap<String, DiscoveryPicks>()
 
     @Synchronized
     private fun save(user: String, picks: DiscoveryPicks) {
-        val f = file(user)
-        val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(DiscoveryPicks.serializer(), picks.copy(running = false)))
-        if (!tmp.renameTo(f)) {
-            f.delete()
-            tmp.renameTo(f)
+        try {
+            DataFiles.write(file(user), json.encodeToString(DiscoveryPicks.serializer(), picks.copy(running = false)))
+            unsaved.remove(user)
+        } catch (e: Exception) {
+            unsaved[user] = picks.copy(running = false, problem = e.message)
         }
     }
 

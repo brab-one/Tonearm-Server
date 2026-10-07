@@ -92,7 +92,7 @@ class History(dataDir: File) {
             repeat(list.size - MAX_PLAYS) { list.removeAt(0) }
             rewrite(user, list)
         } else {
-            playsFile(user).appendText(new.joinToString("") { json.encodeToString(Played.serializer(), it) + "\n" })
+            DataFiles.append(playsFile(user), new.joinToString("") { json.encodeToString(Played.serializer(), it) + "\n" })
         }
         // Playing an artist again after saying no to them takes the no back.
         val dismissed = dismissedOf(user)
@@ -171,7 +171,7 @@ class History(dataDir: File) {
             )
         }
         val added = add(user, scrobbles)
-        marker.writeText("$user $added\n")
+        DataFiles.write(marker, "$user $added\n")
         return added
     }
 
@@ -186,13 +186,7 @@ class History(dataDir: File) {
     }.getOrNull().orEmpty().sortedBy { it.at }.toMutableList()
 
     private fun rewrite(user: String, list: List<Played>) {
-        val f = playsFile(user)
-        val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(list.joinToString("") { json.encodeToString(Played.serializer(), it) + "\n" })
-        if (!tmp.renameTo(f)) {
-            f.delete()
-            tmp.renameTo(f)
-        }
+        DataFiles.write(playsFile(user), list.joinToString("") { json.encodeToString(Played.serializer(), it) + "\n" })
     }
 
     private fun dismissedOf(user: String): MutableList<Dismissed> = dismissals.computeIfAbsent(user) {
@@ -200,7 +194,7 @@ class History(dataDir: File) {
     }
 
     private fun saveDismissed(user: String, list: List<Dismissed>) {
-        dismissedFile(user).writeText(json.encodeToString(ListSerializer(Dismissed.serializer()), list))
+        DataFiles.write(dismissedFile(user), json.encodeToString(ListSerializer(Dismissed.serializer()), list))
     }
 
     private fun playsFile(user: String) = File(dir, URLEncoder.encode(user, Charsets.UTF_8) + ".jsonl")
