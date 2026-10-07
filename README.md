@@ -123,12 +123,16 @@ AI answers, and the apps show the model under AI picks.
 
 | | `AI_PROVIDER` | `AI_URL` | `AI_API_KEY` | `AI_MODEL` |
 |---|---|---|---|---|
-| Ollama (your own) | `ollama` | `http://192.168.1.11:11434` | | default `qwen2.5` |
+| Ollama (your own) | `ollama` | `http://192.168.1.11:11434` | | default `qwen2.5`; `gemma4:26b` knows music much better (needs ~18 GB of RAM or VRAM) |
 | OpenAI | `openai` | (leave out) | `sk-…` | the model's name, e.g. from platform.openai.com/docs/models |
 | OpenRouter (many models, one key) | `openai` | `https://openrouter.ai/api/v1` | `sk-or-…` | e.g. `anthropic/…`, `google/…` as OpenRouter lists them |
 | Google Gemini | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini API key | e.g. a `gemini-…` model |
 | LM Studio, llama.cpp, vLLM, LocalAI | `openai` | e.g. `http://192.168.1.11:1234/v1` | (if it wants one) | the loaded model |
 | Claude | `claude` | (leave out) | `sk-ant-…` (console.anthropic.com) | default `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-4-5` cost less |
+
+With Ollama, the server downloads the model into Ollama when it doesn't have it yet (the log shows the
+progress), so trying another model is just changing `AI_MODEL` and clicking **Update**; `AI_PULL=off` leaves
+downloading to you. Models Ollama no longer needs stay on its disk until you remove them (`ollama rm <model>`).
 
 `openai` covers anything with OpenAI's chat completions API: it asks for an answer fitting a JSON schema, and
 for plain JSON from servers that can't do that. A run asks for 20 albums with a few thousand words of
@@ -154,6 +158,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `LIDARR_REQUESTS` | `all` | `admins`: only Navidrome admins get Lidarr through the server |
 | `AI_PROVIDER` | | `ollama`, `openai` or `claude`: the AI for AI picks and search ([Choosing the AI](#choosing-the-ai)) |
 | `AI_URL`, `AI_API_KEY`, `AI_MODEL` | | Where it is, its key, which model |
+| `AI_PULL` | on | `off`: don't download a missing Ollama model |
 | `OLLAMA_URL`, `OLLAMA_MODEL` | `qwen2.5` | The older way to say Ollama |
 | `MALOJA_URL`, `MALOJA_API_KEY`, `MALOJA_USERS` | | Only to bring a Maloja's history over once ([Moving off Maloja](#moving-off-maloja)) |
 | `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |

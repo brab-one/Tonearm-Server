@@ -24,6 +24,7 @@ class AiTest {
     private val requests = mutableListOf<Pair<String, JsonObject>>()
     private var openAiTakesSchemas = true
     private var claudeStop = "end_turn"
+    private var ollamaHas = true
     private val url get() = "http://127.0.0.1:${fake.address.port}"
 
     private val schema = buildJsonObject {
@@ -54,6 +55,16 @@ class AiTest {
                         "content":[{"type":"thinking","thinking":"","signature":"x"},{"type":"text","text":"{\"answer\":\"yes\"}"}],
                         "stop_reason":"$claudeStop","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}""")
                     "/api/chat" -> answer(ex, 200, """{"message":{"role":"assistant","content":"{\"answer\":\"yes\"}"}}""")
+                    "/api/show" -> if (ollamaHas) answer(ex, 200, """{"details":{}}""") else answer(ex, 404, """{"error":"model not found"}""")
+                    "/api/pull" -> {
+                        ollamaHas = true
+                        answer(ex, 200, listOf(
+                            """{"status":"pulling manifest"}""",
+                            """{"status":"pulling abc","digest":"sha256:abc","total":2000000000,"completed":1000000000}""",
+                            """{"status":"pulling abc","digest":"sha256:abc","total":2000000000,"completed":2000000000}""",
+                            """{"status":"success"}""",
+                        ).joinToString("\n"))
+                    }
                     else -> answer(ex, 404, "{}")
                 }
             }
@@ -66,10 +77,22 @@ class AiTest {
 
     @Test
     fun ollamaGetsTheSchemaAsItsFormat() {
-        assertEquals("""{"answer":"yes"}""", OllamaAi(url, "qwen2.5").json("sys", "hi", schema, 0.5))
+        assertEquals("""{"answer":"yes"}""", OllamaAi(url, "qwen2.5", pull = false).json("sys", "hi", schema, 0.5))
         val (_, body) = requests.single()
         assertEquals(schema, body["format"])
         assertEquals("0.5", body["options"]!!.jsonObject["temperature"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun ollamaDownloadsAModelItHasntGotOnce() {
+        ollamaHas = false
+        val ai = OllamaAi(url, "gemma4:26b")
+        assertEquals("""{"answer":"yes"}""", ai.json("sys", "hi", schema, 0.5))
+        assertEquals(listOf("/api/show", "/api/pull", "/api/chat"), requests.map { it.first })
+        assertEquals("gemma4:26b", requests[1].second["model"]!!.jsonPrimitive.content)
+        requests.clear()
+        ai.json("sys", "again", schema, 0.5)
+        assertEquals(listOf("/api/chat"), requests.map { it.first })
     }
 
     @Test

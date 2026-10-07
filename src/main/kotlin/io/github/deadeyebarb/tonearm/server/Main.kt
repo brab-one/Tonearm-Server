@@ -37,6 +37,8 @@ fun main() {
         System.err.println(e.message)
         exitProcess(2)
     }
+    // Ollama downloads the model now if it hasn't got it, rather than at the first question.
+    ai?.prepare()
     val history = History(dataDir)
     val recommendations = ai?.let { Recommendations(it, navidrome, dataDir, lidarr?.let { proxy -> AlbumCheck(proxy::findAlbum) }, history) }
     val discovery = if (env("DISCOVERY")?.lowercase() == "off") null else Discovery(navidrome, dataDir, history = history)

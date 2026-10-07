@@ -28,6 +28,9 @@ interface Ai {
     /** The model's answer to [prompt] as JSON text fitting [schema]. [temperature] where the model takes one. */
     fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String
 
+    /** Gets the model ready ahead of the first question, where that's a thing (Ollama downloads it). */
+    fun prepare() {}
+
     companion object {
         /**
          * The AI from the environment: AI_PROVIDER (ollama, openai or claude), AI_URL, AI_API_KEY and AI_MODEL.
@@ -43,6 +46,7 @@ interface Ai {
                 "ollama" -> OllamaAi(
                     url ?: env("OLLAMA_URL") ?: throw IllegalArgumentException("Set AI_URL to Ollama's address, e.g. http://192.168.1.11:11434"),
                     model ?: env("OLLAMA_MODEL") ?: "qwen2.5",
+                    pull = env("AI_PULL")?.lowercase() != "off",
                 )
                 "openai" -> OpenAiCompatible(
                     url ?: "https://api.openai.com/v1",
@@ -82,11 +86,27 @@ private fun post(http: HttpClient, url: String, body: JsonObject, headers: Map<S
     return http.send(request, HttpResponse.BodyHandlers.ofString())
 }
 
-/** Ollama's chat API with its structured output (`format`); local, no key. */
-class OllamaAi(private val url: String, override val model: String, private val http: HttpClient = defaultHttp) : Ai {
+/**
+ * Ollama's chat API with its structured output (`format`); local, no key. With [pull] the model is downloaded
+ * into Ollama when it doesn't have it yet, so changing the model is only a setting.
+ */
+class OllamaAi(
+    private val url: String,
+    override val model: String,
+    private val http: HttpClient = defaultHttp,
+    private val pull: Boolean = true,
+) : Ai {
     override val name = "Ollama"
+    private val base = url.trimEnd('/')
+    @Volatile private var present = false
+    private val pulling = Any()
+
+    override fun prepare() {
+        if (pull) Thread({ runCatching { ensureModel() }.onFailure { System.err.println("Ollama: ${it.message}") } }, "ollama-pull").apply { isDaemon = true }.start()
+    }
 
     override fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String {
+        if (pull) ensureModel()
         val body = buildJsonObject {
             put("model", model)
             put("stream", false)
@@ -97,10 +117,60 @@ class OllamaAi(private val url: String, override val model: String, private val 
             put("format", schema)
             putJsonObject("options") { put("temperature", temperature); put("num_ctx", 8192) }
         }
-        val response = post(http, url.trimEnd('/') + "/api/chat", body)
+        var response = post(http, "$base/api/chat", body)
+        if (response.statusCode() == 404 && pull) {
+            // Removed from Ollama since: get it again.
+            present = false
+            ensureModel()
+            response = post(http, "$base/api/chat", body)
+        }
         if (response.statusCode() !in 200..299) throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(200)}")
         return aiJson.parseToJsonElement(response.body()).jsonObject["message"]?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull
             ?: throw IllegalStateException("no answer")
+    }
+
+    /** Downloads the model into Ollama unless it's there (one download at a time; a question waits for it). */
+    private fun ensureModel() {
+        if (present) return
+        synchronized(pulling) {
+            if (present) return
+            val show = post(http, "$base/api/show", buildJsonObject { put("model", model) })
+            if (show.statusCode() in 200..299) {
+                present = true
+                return
+            }
+            if (show.statusCode() != 404) throw IllegalStateException("Ollama answered HTTP ${show.statusCode()} about $model")
+            println("Ollama doesn't have $model yet; downloading it")
+            val request = HttpRequest.newBuilder(URI.create("$base/api/pull"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(buildJsonObject { put("model", model) }.toString()))
+                .build()
+            val response = http.send(request, HttpResponse.BodyHandlers.ofLines())
+            if (response.statusCode() !in 200..299) throw IllegalStateException("Ollama couldn't download $model (HTTP ${response.statusCode()})")
+            var shown = -1L
+            response.body().use { lines ->
+                for (line in lines) {
+                    val status = runCatching { aiJson.parseToJsonElement(line).jsonObject }.getOrNull() ?: continue
+                    status["error"]?.jsonPrimitive?.contentOrNull?.let { throw IllegalStateException("Ollama couldn't download $model: $it") }
+                    val total = status["total"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0
+                    val done = status["completed"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0
+                    // A line per 10% of each part is plenty for the log.
+                    if (total > 100_000_000) {
+                        val tenth = done * 10 / total
+                        if (tenth != shown) {
+                            shown = tenth
+                            println(String.format(java.util.Locale.ROOT, "Downloading %s: %.1f of %.1f GB", model, done / 1e9, total / 1e9))
+                        }
+                    }
+                    if (status["status"]?.jsonPrimitive?.contentOrNull == "success") {
+                        println("Ollama has $model now")
+                        present = true
+                        return
+                    }
+                }
+            }
+            throw IllegalStateException("Ollama stopped downloading $model before it was done")
+        }
     }
 }
 

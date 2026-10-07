@@ -16,6 +16,8 @@ services:
       AI_URL: ${AI_URL:-}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_MODEL: ${AI_MODEL:-}
+      # Ollama gets the model by itself when it's missing; off to leave that to you.
+      AI_PULL: ${AI_PULL:-}
       # Still works for Ollama.
       OLLAMA_URL: ${OLLAMA_URL:-}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-}
