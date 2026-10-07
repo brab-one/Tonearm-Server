@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.deadeyebarb"
-version = "1.5.1"
+version = "1.5.2"
 
 kotlin { jvmToolchain(21) }
 

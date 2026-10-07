@@ -8,13 +8,15 @@ COPY src src
 RUN ./gradlew --no-daemon -q -Pkotlin.compiler.execution.strategy=in-process installDist
 
 FROM eclipse-temurin:21-jre-alpine
-RUN addgroup -S -g 1000 tonearm && adduser -S -D -H -u 1000 -G tonearm tonearm \
+RUN apk add --no-cache su-exec \
+    && addgroup -S -g 1000 tonearm && adduser -S -D -H -u 1000 -G tonearm tonearm \
     && mkdir /data && chown tonearm:tonearm /data
 COPY --from=build /src/build/install/tonearm-server /opt/tonearm-server
-USER tonearm
+COPY --chmod=755 entrypoint.sh /usr/local/bin/tonearm-entrypoint
+# Starts as root only to give DATA_DIR to the tonearm user, then runs the server as that user.
 ENV PORT=8790 BASE_PATH=/connect-tonearm DATA_DIR=/data
 EXPOSE 8790
 VOLUME /data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD wget -qO- "http://127.0.0.1:${PORT}${BASE_PATH}/health" >/dev/null || exit 1
-ENTRYPOINT ["/opt/tonearm-server/bin/tonearm-server"]
+ENTRYPOINT ["/usr/local/bin/tonearm-entrypoint"]

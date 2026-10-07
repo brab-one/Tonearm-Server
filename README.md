@@ -56,9 +56,9 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
 
 To update later, open the stack in Dockge and click **Update**.
 
-The log's `Data:` line should say `/data is writable`. If it warns instead, the server can't keep anything
-(picks, history, weekly picks, shared likes). With the compose file as it is (a Docker volume) that doesn't
-happen; if you changed `/data` to a folder on the host, give it to the server's user: `chown -R 1000:1000 <that folder>`.
+The log's `Data:` line should say `/data is writable`. The container gives `/data` to the server's user
+(uid 1000) when it starts, also when it's a folder mounted from the host; where the host doesn't allow that
+(some NAS shares), it runs the server as root instead and says so in the log.
 
 ### With plain Docker Compose
 
