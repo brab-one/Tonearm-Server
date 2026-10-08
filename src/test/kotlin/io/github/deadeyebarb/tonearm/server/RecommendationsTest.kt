@@ -465,4 +465,21 @@ class RecommendationsTest {
         assertEquals(listOf("Low", "Mazzy Star", "Tricky"), logged.map { it["artist"]!!.jsonPrimitive.content })
         assertEquals(old.toString(), logged.first()["madeAt"]!!.jsonPrimitive.content)
     }
+
+    @Test
+    fun picksNameTheirStandoutSongsAndTheModelHearsTheMostPlayedOnes() {
+        val history = History(Files.createTempDirectory("tonearm-history").toFile())
+        val now = System.currentTimeMillis()
+        history.add("alice", (1..3).map { Played(now - it * 3_600_000L, "Sia", "Chandelier", durationMs = 200_000, listenedMs = 200_000, source = "youtube") })
+        suggests = """{"recommendations":[{"artist":"Tricky","album":"Maxinquaye","year":1995,"songs":["Overcome"," Black Steel ",""],"why":"Trip-hop."}]}"""
+        val engine = engine(history = history, check = AlbumCheck { pick -> listOf(AlbumMatch(pick.copy(album = "Maxinquaye (Deluxe)", songs = emptyList()))) })
+        val picks = engine.ask(engine.taste("alice", login), emptyList())
+        assertEquals(listOf("Overcome", "Black Steel"), picks.single().songs)
+        assertTrue("Sia – Chandelier (3)" in asked!!)
+        // Played a lot, then disliked: it isn't a favourite to steer by anymore.
+        history.dislike("alice", "Sia", "Chandelier", null, true)
+        engine.ask(engine.taste("alice", login), emptyList())
+        assertFalse("Sia – Chandelier (3)" in asked!!)
+        assertTrue("songs" in Json.parseToJsonElement(asked!!).jsonObject["format"].toString())
+    }
 }

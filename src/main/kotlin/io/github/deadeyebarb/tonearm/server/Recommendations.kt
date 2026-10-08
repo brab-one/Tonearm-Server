@@ -25,9 +25,9 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
-/** One album an LLM suggests. */
+/** One album an LLM suggests, with its standout songs (for the weekly picks' playlist). */
 @Serializable
-data class AiPick(val artist: String, val album: String, val year: Int? = null, val why: String = "")
+data class AiPick(val artist: String, val album: String, val year: Int? = null, val why: String = "", val songs: List<String> = emptyList())
 
 /** A user's suggestions as stored and handed to the apps. */
 @Serializable
@@ -121,6 +121,8 @@ data class Taste(
     val tookTo: List<String> = emptyList(),
     /** Songs they disliked, latest first. */
     val dislikedSongs: List<String> = emptyList(),
+    /** The songs they played most this month, wherever they played them, with the plays. */
+    val topSongs: List<String> = emptyList(),
 )
 
 /**
@@ -281,6 +283,12 @@ class Recommendations(
             .filter { loose(it.artist) !in onTrial }.take(30)
         val quarter = history?.listening(user, now - 90 * DAY_MS, artists = 500, songs = 0, recent = 0)?.artists.orEmpty()
         val tookTo = taken.map { "${it.artist} – ${it.album}" }
+        // Not what they disliked or said no to since, though they played it.
+        val disliked = history?.dislikedSongs(user).orEmpty()
+        val dislikedKeys = disliked.map { History.songKey(it.artist, it.title) }.toSet()
+        val topSongs = history?.listening(user, now - 30 * DAY_MS, artists = 0, songs = 25 + onTrial.size * 3 + dislikedKeys.size, recent = 0)?.songs.orEmpty()
+            .filter { loose(Played.mainArtist(it.artist)) !in onTrial && History.songKey(it.artist, it.title) !in dislikedKeys && !history!!.isDismissed(user, Played.mainArtist(it.artist)) }
+            .take(25).map { "${it.artist} – ${it.title} (${it.plays})" }
         // Skips only say something next to few plays: everyone skips their favourites now and then.
         val skippers = played.filter { it.at > now - 90 * DAY_MS && it.skipped }.groupingBy { it.mainArtist }.eachCount()
             .filter { (artist, skips) -> skips >= 3 && skips > 2 * (quarter.firstOrNull { normalize(it.artist) == normalize(artist) }?.plays ?: 0) }
@@ -289,7 +297,8 @@ class Recommendations(
         return Taste(
             mine(albums("frequent", 40 + onTrial.size)).take(40), mine(albums("recent", 25 + onTrial.size)).take(25), liked.distinct().take(80), library,
             lately = lately, skipped = skippers.toList(), dismissed = history?.dismissed(user).orEmpty(), tookTo = tookTo,
-            dislikedSongs = history?.dislikedSongs(user).orEmpty().sortedByDescending { it.at }.take(40).map { "${it.artist} – ${it.title}" },
+            dislikedSongs = disliked.sortedByDescending { it.at }.take(40).map { "${it.artist} – ${it.title}" },
+            topSongs = topSongs,
         )
     }
 
@@ -319,9 +328,10 @@ class Recommendations(
                 else -> "an album (no $no) "
             }
             appendLine("Every album must be ${kind}by an artist who is NOT in their library, must really exist, and every artist only once.")
-            appendLine("Mix a few safe bets with some less obvious finds. For each, give the year and one short sentence on why it fits.")
+            appendLine("Mix a few safe bets with some less obvious finds. For each, give the year, its 3 standout songs (their exact track titles) and one short sentence on why it fits.")
             if (taste.mostPlayed.isNotEmpty()) appendLine("\nMost played albums:\n" + taste.mostPlayed.joinToString("\n"))
             if (taste.recent.isNotEmpty()) appendLine("\nPlayed recently:\n" + taste.recent.joinToString("\n"))
+            if (taste.topSongs.isNotEmpty()) appendLine("\nThe songs they played most this month, wherever they played them (plays in brackets):\n" + taste.topSongs.joinToString("\n"))
             if (taste.liked.isNotEmpty()) appendLine("\nLiked:\n" + taste.liked.joinToString("\n"))
             if (taste.lately.isNotEmpty()) {
                 appendLine("\nWhat they've played this month, wherever they played it (plays in brackets; * = not in their library, so heard on YouTube Music):")
@@ -358,7 +368,8 @@ class Recommendations(
         // Read leniently: one oddly made entry is skipped, not the whole answer.
         val picks = list.mapNotNull { element ->
             val o = element as? JsonObject ?: return@mapNotNull null
-            AiPick(o.str("artist").trim(), o.str("album").trim(), (o["year"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull(), o.str("why").trim())
+            val songs = (o["songs"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty) }.take(5)
+            AiPick(o.str("artist").trim(), o.str("album").trim(), (o["year"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull(), o.str("why").trim(), songs)
                 .takeIf { it.artist.isNotEmpty() && it.album.isNotEmpty() }
         }
         val dropped = linkedMapOf<String, Int>()
@@ -407,7 +418,7 @@ class Recommendations(
             val match = matches.firstOrNull { m -> m.kinds.none { it in UNWANTED && it !in allowed } }
                 ?: return drop(matches.first().kinds.filter { it in UNWANTED }.joinToString("/"))
             if (!artists.add(loose(match.pick.artist))) return drop("another album by the same artist")
-            checked += match.pick.copy(why = pick.why)
+            checked += match.pick.copy(why = pick.why, songs = pick.songs)
         }
         fun settle(): List<AiPick> = unchecked.filter { artists.add(loose(it.artist)) || false.also { drop("another album by the same artist") } }
             .also { unchecked.clear() }
@@ -604,9 +615,13 @@ class Recommendations(
                             putJsonObject("artist") { put("type", "string") }
                             putJsonObject("album") { put("type", "string") }
                             putJsonObject("year") { put("type", "integer") }
+                            putJsonObject("songs") {
+                                put("type", "array")
+                                putJsonObject("items") { put("type", "string") }
+                            }
                             putJsonObject("why") { put("type", "string") }
                         }
-                        put("required", buildJsonArray { listOf("artist", "album", "year", "why").forEach { add(JsonPrimitive(it)) } })
+                        put("required", buildJsonArray { listOf("artist", "album", "year", "songs", "why").forEach { add(JsonPrimitive(it)) } })
                     }
                 }
             }

@@ -91,7 +91,7 @@ class TonearmServer(
         if (bytes.size > MAX_PAYLOAD) return error(exchange, 413, "Payload too large")
         if (!path.startsWith("api/")) {
             val call = ProxyCall(exchange.requestMethod.uppercase(), path.substringAfter('/'), exchange.requestURI.rawQuery, exchange.requestHeaders.getFirst("Content-Type"), bytes)
-            return relay(exchange, lidarr?.handle(call, login.admin) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up"))
+            return relay(exchange, lidarr?.handle(call, login.admin, user) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up"))
         }
         val op = path.removePrefix("api/")
         val payload = bytes.decodeToString()
@@ -111,6 +111,21 @@ class TonearmServer(
                 put("history", true)
                 put("dislikes", true)
                 recommendations?.let { put("ai", it.label) }
+                // Where this user's weekly picks download to, when each user has their own.
+                lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
+            }
+            "picksfolder" -> {
+                val proxy = lidarr?.takeIf { it.available(login.admin) } ?: return error(exchange, 404, "This Tonearm server has no Lidarr for you")
+                val folder = try {
+                    proxy.ensurePicksFolder(user)
+                } catch (e: Exception) {
+                    return error(exchange, 502, "Lidarr: ${e.message}")
+                } ?: return error(exchange, 404, "This Tonearm server has no picks folders (PICKS_FOLDER)")
+                buildJsonObject {
+                    put("path", folder.path)
+                    put("ready", folder.ready)
+                    folder.problem?.let { put("problem", it) }
+                }
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")

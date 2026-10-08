@@ -10,7 +10,7 @@ import kotlin.system.exitProcess
  * The Tonearm server: Tonearm Connect for every user of a Navidrome server, Lidarr without handing out its key,
  * listening history, and picks. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
  * /connect-tonearm), PORT (8790), DATA_DIR (/data); optional LIDARR_URL + LIDARR_API_KEY (+ LIDARR_REQUESTS =
- * all | admins), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
+ * all | admins, + PICKS_FOLDER for each user's weekly picks in a folder of their own), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
  * and AI_MODEL (+ AI_PULL, AI_CONTEXT for Ollama), or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
  * API (DISCOVERY=off turns that off). MALOJA_URL (+ MALOJA_API_KEY, MALOJA_USERS) only brings a Maloja's
  * history over, once.
@@ -29,7 +29,7 @@ fun main() {
             System.err.println("LIDARR_URL is set but LIDARR_API_KEY isn't (Lidarr → Settings → General → API Key)")
             exitProcess(2)
         }
-        LidarrProxy(Upstream("Lidarr", url, "X-Api-Key", key), requestsForEveryone = env("LIDARR_REQUESTS")?.lowercase() != "admins")
+        LidarrProxy(Upstream("Lidarr", url, "X-Api-Key", key), requestsForEveryone = env("LIDARR_REQUESTS")?.lowercase() != "admins", picksRoot = env("PICKS_FOLDER"))
     }
     val ai = try {
         Ai.fromEnv(::env)
@@ -46,6 +46,7 @@ fun main() {
     TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, recommendations, discovery, history, malojaImport).start()
     println("Tonearm server $version on port $port under ${"/" + basePath.trim('/')}, checking logins with Navidrome at $navidrome, data in $dataDir")
     println("Lidarr: " + (env("LIDARR_URL")?.let { "$it, " + if (lidarr!!.available(false)) "requests for everyone" else "admins only" } ?: "not set up"))
+    env("PICKS_FOLDER")?.let { println("Weekly picks: each user's in their own folder in $it (as Lidarr sees it)" + if (lidarr == null) ", but there's no Lidarr" else "") }
     println("AI picks and search: " + (ai?.let { "${it.name.takeUnless { n -> n == "The AI" } ?: "OpenAI-style API"} with ${it.model}" } ?: "not set up (AI_PROVIDER)"))
     println("Discovery and similar artists: " + if (discovery != null) "from Deezer" else "off")
     if (malojaImport != null) println("Maloja: its history comes over for the first of ${env("MALOJA_USERS") ?: "Navidrome's admins"} to use the apps, unless it did before")

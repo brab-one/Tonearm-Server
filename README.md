@@ -15,7 +15,8 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   against Lidarr's metadata so made-up albums are dropped, and so are singles, EPs, live albums and
   compilations (unless "more like" is about one). Best fit first, one album per artist. Earlier picks only
   count as a hit once they're played again at least half a day after the first time, or liked. The apps can ask for "more like this" (a song, album, artist or playlist),
-  and their **weekly picks** download the first few every week.
+  and their **weekly picks** download the first few every week, as a playlist of their standout songs. With
+  `PICKS_FOLDER`, each user's weekly picks land in a library only they see ([Private weekly picks](#private-weekly-picks)).
 - **Search help**: the apps search Deezer (songs, albums, artists) through it alongside the library and YouTube
   Music, and can ask the AI what a search means ("dreamy 90s trip hop").
 - **Discovery picks and similar artists**, no AI needed: the artists each user plays and likes most, their
@@ -155,6 +156,42 @@ for plain JSON from servers that can't do that. A run asks for 20 albums with a 
 listening history, so with a paid service each run costs a few cents; picks are renewed weekly or when
 someone asks. Without `AI_PROVIDER`, `OLLAMA_URL` (and `OLLAMA_MODEL`) alone still mean Ollama, as before.
 
+## Private weekly picks
+
+Weekly picks download albums the AI picked for one person. Without more setup they go into the shared library,
+so everyone sees them, and only admins get weekly picks. With a picks folder, each user's picks go into a
+folder of their own, which Navidrome shows as a library only that user can open (admins see every library).
+Then everyone gets weekly picks, not only admins. A week later the albums are deleted again, unless the user
+liked a song from them or put one in another playlist.
+
+Navidrome libraries can't overlap, so the picks folder has to be **outside** your music folder:
+
+1. Make the folder on the host, next to your music, e.g. `/mnt/tank/media/picks`, owned by the same user as
+   your music folder (the one Lidarr writes as).
+2. Mount it into **Lidarr** and **Navidrome** at the same path, e.g. `/picks`, in both stacks in Dockge, and
+   **Update** them:
+   ```yaml
+       volumes:
+         - /mnt/tank/media/picks:/picks
+   ```
+3. Add `PICKS_FOLDER=/picks` to this server's `.env` and **Update** it. The log says
+   `Weekly picks: each user's in their own folder in /picks`.
+4. For each user (the folder is their Navidrome login in lowercase; a login with spaces or other signs a path
+   can't hold gets a short code added, and the apps show the exact path when it's missing):
+   - make `/mnt/tank/media/picks/<user>` (owned like the music folder);
+   - in Navidrome, **Settings → Libraries → +**: name it e.g. `<user>'s picks`, path `/picks/<user>`, and
+     give only that user access.
+
+   The server adds the folder to Lidarr by itself (named `Tonearm picks: <user>`) when that user's first weekly
+   picks start. Until the folder is there, the apps say what's missing.
+
+Everything else stays shared: albums someone requests or likes go into your usual root folder as before, and a
+pick whose artist Lidarr already keeps elsewhere is skipped, since an album always goes where its artist is. For
+the same reason, nobody can request, monitor or search for an album by an artist who is in someone's picks (the
+apps say so). That stays as long as the artist is there, also when its owner keeps an album; an admin can move such
+an artist to a shared root folder in Lidarr (edit the artist, change its root folder, move the files). Non-admins
+can only delete what's in their own picks folder (which the weekly clean-up does for them).
+
 ## Moving off Maloja
 
 The apps don't use Maloja anymore; the history lives here now. To bring what Maloja has over, leave
@@ -172,6 +209,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `DATA_DIR` | `/data` | Each user's listening history, shared likes and picks, small JSON files |
 | `LIDARR_URL`, `LIDARR_API_KEY` | | Lidarr through the server |
 | `LIDARR_REQUESTS` | `all` | `admins`: only Navidrome admins get Lidarr through the server |
+| `PICKS_FOLDER` | | A folder (as Lidarr sees it) holding one folder per user for their weekly picks ([Private weekly picks](#private-weekly-picks)) |
 | `AI_PROVIDER` | | `ollama`, `openai` or `claude`: the AI for AI picks and search ([Choosing the AI](#choosing-the-ai)) |
 | `AI_URL`, `AI_API_KEY`, `AI_MODEL` | | Where it is, its key, which model |
 | `AI_PULL` | on | `off`: don't download a missing Ollama model |
