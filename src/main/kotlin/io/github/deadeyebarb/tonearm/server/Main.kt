@@ -11,7 +11,7 @@ import kotlin.system.exitProcess
  * listening history, and picks. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
  * /connect-tonearm), PORT (8790), DATA_DIR (/data); optional LIDARR_URL + LIDARR_API_KEY (+ LIDARR_REQUESTS =
  * all | admins), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
- * and AI_MODEL, or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
+ * and AI_MODEL (+ AI_PULL, AI_CONTEXT for Ollama), or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
  * API (DISCOVERY=off turns that off). MALOJA_URL (+ MALOJA_API_KEY, MALOJA_USERS) only brings a Maloja's
  * history over, once.
  */

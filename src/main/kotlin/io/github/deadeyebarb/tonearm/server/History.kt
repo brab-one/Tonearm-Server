@@ -136,7 +136,7 @@ class History(dataDir: File) {
 
     fun dismiss(user: String, artist: String, album: String?) = synchronized(lock(user)) {
         val list = dismissedOf(user)
-        list.removeAll { same(it.artist, artist) && it.album?.let(::normalize) == album?.let(::normalize) }
+        list.removeAll { same(it.artist, artist) && it.album?.let(Recommendations::looseTitle) == album?.let(Recommendations::looseTitle) }
         list += Dismissed(artist.trim(), album?.trim()?.ifEmpty { null }, System.currentTimeMillis())
         saveDismissed(user, list)
     }
@@ -157,7 +157,7 @@ class History(dataDir: File) {
 
     /** Whether the user said no to this artist, or to this album of theirs. */
     fun isDismissed(user: String, artist: String, album: String? = null): Boolean = dismissed(user).any { d ->
-        same(d.artist, artist) && (d.album == null || album != null && Recommendations.bareTitle(d.album) == Recommendations.bareTitle(album))
+        same(d.artist, artist) && (d.album == null || album != null && Recommendations.looseTitle(d.album) == Recommendations.looseTitle(album))
     }
 
     /**
@@ -230,7 +230,8 @@ class History(dataDir: File) {
         /** About ten years of a lot of listening. */
         private const val MAX_PLAYS = 200_000
 
-        private fun normalize(text: String) = Recommendations.normalize(text)
+        /** Names as the picks compare them, so artists in other scripts don't all count as one. */
+        private fun normalize(text: String) = Recommendations.loose(text)
 
         fun same(a: String, b: String) = normalize(a) == normalize(b)
 

@@ -30,7 +30,11 @@ class ClaudeAi(apiKey: String, override val model: String, baseUrl: String? = nu
         .timeout(Duration.ofMinutes(10))
         .build()
 
-    override fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String {
+    /**
+     * [think] isn't passed on: the current models (Opus 5/5.5, Sonnet 5/5.5, Fable) think as much as they see fit by
+     * themselves, while older ones (4.x, Haiku 4.5) answer without thinking.
+     */
+    override fun answer(system: String, prompt: String, schema: JsonObject, temperature: Double, think: Boolean): AiAnswer {
         val format = JsonOutputFormat.builder()
             .schema(JsonOutputFormat.Schema.builder().apply {
                 (Ai.closed(schema) as JsonObject).forEach { (k, v) -> putAdditionalProperty(k, JsonValue.from(plain(v))) }
@@ -53,12 +57,26 @@ class ClaudeAi(apiKey: String, override val model: String, baseUrl: String? = nu
         val message = client.messages().create(params)
         if (message.stopReason().orElse(null) == StopReason.REFUSAL) throw IllegalStateException("Claude declined to answer")
         if (message.stopReason().orElse(null) == StopReason.MAX_TOKENS) throw IllegalStateException("Claude's answer was cut off")
-        return message.content().mapNotNull { block -> block.text().orElse(null)?.text() }.joinToString("")
+        val text = message.content().mapNotNull { block -> block.text().orElse(null)?.text() }.joinToString("")
             .ifBlank { throw IllegalStateException("no answer") }
+        return AiAnswer(
+            text,
+            promptTokens = message.usage().inputTokens().toInt(),
+            outputTokens = message.usage().outputTokens().toInt(),
+            thinkingChars = thinkingChars(message.content().mapNotNull { block -> block.thinking().orElse(null)?.thinking() }),
+            stop = message.stopReason().orElse(null)?.toString(),
+        )
     }
 
     companion object {
         const val DEFAULT_MODEL = "claude-opus-5-5"
+
+        /** No thinking blocks: it didn't think. Blocks without their text (the API can leave it out): it did, but how much can't be told. */
+        private fun thinkingChars(blocks: List<String>): Int? = when {
+            blocks.isEmpty() -> 0
+            blocks.all { it.isEmpty() } -> null
+            else -> blocks.sumOf { it.length }
+        }
 
         /** The models that take the API's `fallbacks: "default"`. */
         private val FALLBACK_MODELS = setOf("claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5")

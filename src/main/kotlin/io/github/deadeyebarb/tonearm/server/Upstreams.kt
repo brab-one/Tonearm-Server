@@ -135,21 +135,46 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
         return paths
     }
 
-    /** The album in Lidarr's metadata with this artist and title (any edition), or null; throws when the search fails. */
-    fun findAlbum(pick: AiPick): AiPick? {
+    /**
+     * The releases in Lidarr's metadata with this artist and title (any edition), each with its kind ("Album", "EP",
+     * "Live"…), the likeliest first: the very title ("X" before "X (Remixes)"), then a plain studio album, then the
+     * year closest to the pick's. None when it doesn't exist; throws when the search fails. "&", "+" and "and" are the
+     * same, and so are "The Beatles" and "Beatles".
+     */
+    fun findAlbum(pick: AiPick): List<AlbumMatch> {
         val term = java.net.URLEncoder.encode("${pick.artist} ${pick.album}", Charsets.UTF_8)
         val answer = lidarr.send(ProxyCall("GET", "api/v1/album/lookup", "term=$term", null, ByteArray(0)))
         if (answer.status != 200) throw IllegalStateException("Lidarr's album search answered ${answer.status}")
-        val hit = json.parseToJsonElement(answer.body.decodeToString()).jsonArray.map { it.jsonObject }.firstOrNull { album ->
-            Recommendations.bareTitle(album.string("title").orEmpty()) == Recommendations.bareTitle(pick.album) &&
-                Recommendations.normalize((album["artist"] as? JsonObject)?.string("artistName").orEmpty()) == Recommendations.normalize(pick.artist)
-        } ?: return null
-        return AiPick(
-            (hit["artist"] as JsonObject).string("artistName") ?: pick.artist,
-            hit.string("title") ?: pick.album,
-            hit.string("releaseDate")?.take(4)?.toIntOrNull() ?: pick.year,
-            pick.why,
-        )
+        val title = Recommendations.loose(pick.album)
+        return json.parseToJsonElement(answer.body.decodeToString()).jsonArray.mapNotNull { it as? JsonObject }
+            .filter { album ->
+                Recommendations.looseTitle(album.string("title").orEmpty()) == Recommendations.looseTitle(pick.album) &&
+                    Recommendations.loose((album["artist"] as? JsonObject)?.string("artistName").orEmpty()) == Recommendations.loose(pick.artist)
+            }
+            .sortedWith(compareBy<JsonObject>(
+                { if (Recommendations.loose(it.string("title").orEmpty()) == title) 0 else 1 },
+                { if (kinds(it) - "Studio" == setOf("Album")) 0 else 1 },
+                { album -> pick.year?.let { year -> album.string("releaseDate")?.take(4)?.toIntOrNull()?.let { kotlin.math.abs(it - year) } } ?: Int.MAX_VALUE },
+            ))
+            .map { hit ->
+                AlbumMatch(
+                    AiPick(
+                        (hit["artist"] as JsonObject).string("artistName") ?: pick.artist,
+                        hit.string("title") ?: pick.album,
+                        hit.string("releaseDate")?.take(4)?.toIntOrNull() ?: pick.year,
+                        pick.why,
+                    ),
+                    kinds(hit),
+                )
+            }
+    }
+
+    /** An album's type and secondary types as Lidarr names them ("Album", "Live"…); secondary types come as names or as objects with one. */
+    private fun kinds(album: JsonObject): Set<String> = buildSet {
+        album.string("albumType")?.let(::add)
+        (album["secondaryTypes"] as? JsonArray).orEmpty().forEach { type ->
+            ((type as? JsonPrimitive)?.contentOrNull ?: (type as? JsonObject)?.string("name"))?.let(::add)
+        }
     }
 
     private fun jsonObject(body: ByteArray) = runCatching { json.parseToJsonElement(body.decodeToString()).jsonObject }.getOrNull()

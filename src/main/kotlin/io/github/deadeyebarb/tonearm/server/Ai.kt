@@ -19,14 +19,34 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
+/** A model's answer, and what it took, for the log. */
+data class AiAnswer(
+    /** The JSON. */
+    val text: String,
+    val promptTokens: Int? = null,
+    /** Everything it wrote, thinking included. */
+    val outputTokens: Int? = null,
+    /** How long its thinking was (characters): 0 when it didn't think, null when it can't be told. */
+    val thinkingChars: Int? = null,
+    /** Why it stopped ("stop", "length", "end_turn"…). */
+    val stop: String? = null,
+)
+
 /** A language model that answers with JSON fitting a schema: Ollama, anything with OpenAI's API, or Claude. */
 interface Ai {
     /** Who answers, for messages ("Ollama", "Claude"). */
     val name: String
     val model: String
 
-    /** The model's answer to [prompt] as JSON text fitting [schema]. [temperature] where the model takes one. */
-    fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String
+    /**
+     * The model's answer to [prompt] as JSON text fitting [schema]. [temperature] where the model takes one. With
+     * [think], an Ollama model that can think does so before answering (slower, and it remembers more of what it
+     * knows); other AIs decide that by themselves.
+     */
+    fun answer(system: String, prompt: String, schema: JsonObject, temperature: Double, think: Boolean = false): AiAnswer
+
+    /** Just the JSON of [answer], without thinking. */
+    fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String = answer(system, prompt, schema, temperature).text
 
     /** Gets the model ready ahead of the first question, where that's a thing (Ollama downloads it). */
     fun prepare() {}
@@ -47,6 +67,8 @@ interface Ai {
                     url ?: env("OLLAMA_URL") ?: throw IllegalArgumentException("Set AI_URL to Ollama's address, e.g. http://192.168.1.11:11434"),
                     model ?: env("OLLAMA_MODEL") ?: "qwen2.5",
                     pull = env("AI_PULL")?.lowercase() != "off",
+                    context = env("AI_CONTEXT")?.let { it.toIntOrNull()?.takeIf { n -> n >= 2048 } ?: throw IllegalArgumentException("AI_CONTEXT is \"$it\"; give the context length in tokens, e.g. 16384") }
+                        ?: OllamaAi.DEFAULT_CONTEXT,
                 )
                 "openai" -> OpenAiCompatible(
                     url ?: "https://api.openai.com/v1",
@@ -88,26 +110,30 @@ private fun post(http: HttpClient, url: String, body: JsonObject, headers: Map<S
 
 /**
  * Ollama's chat API with its structured output (`format`); local, no key. With [pull] the model is downloaded
- * into Ollama when it doesn't have it yet, so changing the model is only a setting.
+ * into Ollama when it doesn't have it yet, so changing the model is only a setting. Every question uses the same
+ * [context] length (tokens), since another one makes Ollama load the model again.
  */
 class OllamaAi(
     private val url: String,
     override val model: String,
     private val http: HttpClient = defaultHttp,
     private val pull: Boolean = true,
+    private val context: Int = DEFAULT_CONTEXT,
 ) : Ai {
     override val name = "Ollama"
     private val base = url.trimEnd('/')
     @Volatile private var present = false
     private val pulling = Any()
+    /** False once Ollama said this model can't think: it's asked without from then on. */
+    @Volatile private var canThink = true
 
     override fun prepare() {
         if (pull) Thread({ runCatching { ensureModel() }.onFailure { System.err.println("Ollama: ${it.message}") } }, "ollama-pull").apply { isDaemon = true }.start()
     }
 
-    override fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String {
+    override fun answer(system: String, prompt: String, schema: JsonObject, temperature: Double, think: Boolean): AiAnswer {
         if (pull) ensureModel()
-        val body = buildJsonObject {
+        fun body(thinking: Boolean?) = buildJsonObject {
             put("model", model)
             put("stream", false)
             putJsonArray("messages") {
@@ -115,18 +141,36 @@ class OllamaAi(
                 add(buildJsonObject { put("role", "user"); put("content", prompt) })
             }
             put("format", schema)
-            putJsonObject("options") { put("temperature", temperature); put("num_ctx", 8192) }
+            // Said either way: a model that thinks by itself would otherwise also think for a quick search.
+            thinking?.let { put("think", it) }
+            putJsonObject("options") { put("temperature", temperature); put("num_ctx", context) }
         }
-        var response = post(http, "$base/api/chat", body)
+        val thinking = think && canThink
+        fun ask() = post(http, "$base/api/chat", body(thinking.takeIf { canThink }))
+        var response = ask()
         if (response.statusCode() == 404 && pull) {
             // Removed from Ollama since: get it again.
             present = false
             ensureModel()
-            response = post(http, "$base/api/chat", body)
+            response = ask()
+        }
+        // Ollama looks for the model before it checks what it can do, so this comes after the download.
+        if (response.statusCode() == 400 && canThink && "does not support thinking" in response.body()) {
+            // A model that can't think says so; it answers all the same without.
+            canThink = false
+            response = post(http, "$base/api/chat", body(null))
         }
         if (response.statusCode() !in 200..299) throw IllegalStateException("HTTP ${response.statusCode()}: ${response.body().take(200)}")
-        return aiJson.parseToJsonElement(response.body()).jsonObject["message"]?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull
-            ?: throw IllegalStateException("no answer")
+        val reply = aiJson.parseToJsonElement(response.body()).jsonObject
+        val message = reply["message"]?.jsonObject
+        val content = message?.get("content")?.jsonPrimitive?.contentOrNull ?: throw IllegalStateException("no answer")
+        return AiAnswer(
+            OpenAiCompatible.jsonIn(content),
+            promptTokens = reply.int("prompt_eval_count"),
+            outputTokens = reply.int("eval_count"),
+            thinkingChars = (message["thinking"] as? JsonPrimitive)?.contentOrNull?.length ?: if (thinking && canThink) 0 else null,
+            stop = (reply["done_reason"] as? JsonPrimitive)?.contentOrNull,
+        )
     }
 
     /** Downloads the model into Ollama unless it's there (one download at a time; a question waits for it). */
@@ -172,6 +216,11 @@ class OllamaAi(
             throw IllegalStateException("Ollama stopped downloading $model before it was done")
         }
     }
+
+    companion object {
+        /** Room for the listening the picks are made from, the model's thinking and its answer. */
+        const val DEFAULT_CONTEXT = 16_384
+    }
 }
 
 /**
@@ -187,7 +236,8 @@ class OpenAiCompatible(
 ) : Ai {
     override val name = "The AI"
 
-    override fun json(system: String, prompt: String, schema: JsonObject, temperature: Double): String {
+    /** [think] isn't passed on: models that reason do so by themselves here. */
+    override fun answer(system: String, prompt: String, schema: JsonObject, temperature: Double, think: Boolean): AiAnswer {
         val formats = listOf(
             buildJsonObject {
                 put("type", "json_schema")
@@ -211,10 +261,20 @@ class OpenAiCompatible(
             // A 400 is often just a response_format it doesn't know: try the next, plainer one.
             if (response.statusCode() == 400) continue
             if (response.statusCode() !in 200..299) throw IllegalStateException(last)
-            val content = aiJson.parseToJsonElement(response.body()).jsonObject["choices"]?.jsonArray?.firstOrNull()
-                ?.jsonObject?.get("message")?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull
-                ?: throw IllegalStateException("no answer")
-            return jsonIn(content)
+            val reply = aiJson.parseToJsonElement(response.body()).jsonObject
+            val choice = reply["choices"]?.jsonArray?.firstOrNull()?.jsonObject
+            val message = choice?.get("message")?.jsonObject
+            val content = message?.get("content")?.jsonPrimitive?.contentOrNull ?: throw IllegalStateException("no answer")
+            val usage = reply["usage"] as? JsonObject
+            // Some providers hand the reasoning back (DeepSeek, OpenRouter); otherwise only its token count says it happened.
+            val reasoning = (message["reasoning_content"] ?: message["reasoning"])?.let { (it as? JsonPrimitive)?.contentOrNull }
+            return AiAnswer(
+                jsonIn(content),
+                promptTokens = usage?.int("prompt_tokens"),
+                outputTokens = usage?.int("completion_tokens"),
+                thinkingChars = reasoning?.length,
+                stop = choice["finish_reason"]?.let { (it as? JsonPrimitive)?.contentOrNull },
+            )
         }
         throw IllegalStateException(last)
     }
@@ -228,3 +288,5 @@ class OpenAiCompatible(
         }
     }
 }
+
+private fun JsonObject.int(key: String): Int? = (this[key] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()

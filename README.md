@@ -12,8 +12,10 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   rotation, rediscover and Daily Discovery come from it. No Maloja needed (see [Moving off Maloja](#moving-off-maloja)).
 - **AI picks**: albums by artists you don't have, suggested by the AI of your choice (your own Ollama, any
   service with OpenAI's API, or Claude) from what each user plays, likes, skips and said no to, checked
-  against Lidarr's metadata so made-up albums are dropped. The apps can ask for "more like this" (a song,
-  album, artist or playlist), and their **weekly picks** download the first few every week.
+  against Lidarr's metadata so made-up albums are dropped, and so are singles, EPs, live albums and
+  compilations (unless "more like" is about one). Best fit first, one album per artist. Earlier picks only
+  count as a hit once they're played again at least half a day after the first time, or liked. The apps can ask for "more like this" (a song, album, artist or playlist),
+  and their **weekly picks** download the first few every week.
 - **Search help**: the apps search Deezer (songs, albums, artists) through it alongside the library and YouTube
   Music, and can ask the AI what a search means ("dreamy 90s trip hop").
 - **Discovery picks and similar artists**, no AI needed: the artists each user plays and likes most, their
@@ -138,6 +140,16 @@ With Ollama, the server downloads the model into Ollama when it doesn't have it 
 progress), so trying another model is just changing `AI_MODEL` and clicking **Update**; `AI_PULL=off` leaves
 downloading to you. Models Ollama no longer needs stay on its disk until you remove them (`ollama rm <model>`).
 
+For picks, a model that can think (gemma4, qwen3 and the like) thinks before answering: slower, but it
+remembers more albums. AI search is asked without thinking, for speed. Models that can't think are asked
+without, by themselves. Every question uses the same context length (`AI_CONTEXT`, 16384 tokens), because
+another one makes Ollama load the model again.
+
+To see how the picks are made, each run leaves a line in the log (`AI picks for alice: kept 12 of 20 (left
+out: in the library 3, not in Lidarr 2, Live 1), thought 4.2k chars, 3100 + 2900 tokens, 140 s`). In
+`DATA_DIR/recommendations/`, `<user>.runs.jsonl` keeps the last 1,000 of those runs, `<user>.picks.jsonl`
+the last 5,000 picks, and `<user>.prompt.txt` what the model was last asked.
+
 `openai` covers anything with OpenAI's chat completions API: it asks for an answer fitting a JSON schema, and
 for plain JSON from servers that can't do that. A run asks for 20 albums with a few thousand words of
 listening history, so with a paid service each run costs a few cents; picks are renewed weekly or when
@@ -163,6 +175,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `AI_PROVIDER` | | `ollama`, `openai` or `claude`: the AI for AI picks and search ([Choosing the AI](#choosing-the-ai)) |
 | `AI_URL`, `AI_API_KEY`, `AI_MODEL` | | Where it is, its key, which model |
 | `AI_PULL` | on | `off`: don't download a missing Ollama model |
+| `AI_CONTEXT` | `16384` | Ollama's context length in tokens, the same for every question |
 | `OLLAMA_URL`, `OLLAMA_MODEL` | `qwen2.5` | The older way to say Ollama |
 | `MALOJA_URL`, `MALOJA_API_KEY`, `MALOJA_USERS` | | Only to bring a Maloja's history over once ([Moving off Maloja](#moving-off-maloja)) |
 | `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |
