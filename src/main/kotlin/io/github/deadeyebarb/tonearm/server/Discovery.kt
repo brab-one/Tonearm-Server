@@ -204,6 +204,8 @@ class Discovery(
         history?.listening(user, System.currentTimeMillis() - 60 * DAY_MS, artists = 100, songs = 0, recent = 0)?.artists.orEmpty().forEach { counted ->
             add(counted.artist, 0.4 * minOf(counted.plays, 8) - if (counted.skips > 2 * counted.plays) 1.5 else 0.0)
         }
+        // Each disliked song counts against its artist as a seed.
+        history?.dislikedSongs(user).orEmpty().forEach { add(Played.mainArtist(it.artist), -0.75) }
         return weights.values.filter { it.second > 0 }.sortedByDescending { it.second }.take(SEEDS)
     }
 

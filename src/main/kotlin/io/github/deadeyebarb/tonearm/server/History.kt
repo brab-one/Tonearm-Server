@@ -51,6 +51,10 @@ data class Played(
 @Serializable
 data class Dismissed(val artist: String, val album: String? = null, val at: Long = 0)
 
+/** A song the user disliked. */
+@Serializable
+data class DislikedSong(val artist: String, val title: String, val album: String? = null, val at: Long = 0)
+
 @Serializable
 data class ArtistCount(val artist: String, val plays: Int, val skips: Int = 0, val lastPlayed: Long = 0)
 
@@ -79,6 +83,7 @@ class History(dataDir: File) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
     private val plays = ConcurrentHashMap<String, MutableList<Played>>()
     private val dismissals = ConcurrentHashMap<String, MutableList<Dismissed>>()
+    private val dislikes = ConcurrentHashMap<String, MutableList<DislikedSong>>()
 
     /** Adds what an app played; the same song at the same moment only once (apps retry). Returns how many were new. */
     fun add(user: String, played: List<Played>): Int = synchronized(lock(user)) {
@@ -137,6 +142,18 @@ class History(dataDir: File) {
     }
 
     fun dismissed(user: String): List<Dismissed> = synchronized(lock(user)) { dismissedOf(user).toList() }
+
+    /** Dislikes a song, or ([on] false) takes that back. */
+    fun dislike(user: String, artist: String, title: String, album: String?, on: Boolean) = synchronized(lock(user)) {
+        val list = dislikedOf(user)
+        list.removeAll { songKey(it.artist, it.title) == songKey(artist, title) }
+        if (on) list += DislikedSong(artist.trim(), title.trim(), album?.trim()?.ifEmpty { null }, System.currentTimeMillis())
+        DataFiles.write(dislikedFile(user), json.encodeToString(ListSerializer(DislikedSong.serializer()), list))
+    }
+
+    fun dislikedSongs(user: String): List<DislikedSong> = synchronized(lock(user)) { dislikedOf(user).toList() }
+
+    fun isSongDisliked(user: String, artist: String, title: String): Boolean = songKey(artist, title).let { key -> dislikedSongs(user).any { songKey(it.artist, it.title) == key } }
 
     /** Whether the user said no to this artist, or to this album of theirs. */
     fun isDismissed(user: String, artist: String, album: String? = null): Boolean = dismissed(user).any { d ->
@@ -201,6 +218,12 @@ class History(dataDir: File) {
 
     private fun dismissedFile(user: String) = File(dir, URLEncoder.encode(user, Charsets.UTF_8) + ".dismissed.json")
 
+    private fun dislikedOf(user: String): MutableList<DislikedSong> = dislikes.computeIfAbsent(user) {
+        runCatching { json.decodeFromString(ListSerializer(DislikedSong.serializer()), dislikedFile(user).readText()) }.getOrDefault(emptyList()).toMutableList()
+    }
+
+    private fun dislikedFile(user: String) = File(dir, URLEncoder.encode(user, Charsets.UTF_8) + ".disliked-songs.json")
+
     fun toJson(listening: Listening): JsonObject = Json.encodeToJsonElement(Listening.serializer(), listening).jsonObject
 
     companion object {
@@ -210,5 +233,11 @@ class History(dataDir: File) {
         private fun normalize(text: String) = Recommendations.normalize(text)
 
         fun same(a: String, b: String) = normalize(a) == normalize(b)
+
+        /**
+         * A song by its first artist and its title without "(Official Video)", remaster notes and featured guests: the
+         * same key the apps use (Dislikes.songKey), so a YouTube Music copy is the library's song.
+         */
+        fun songKey(artist: String, title: String) = SongKey.of(artist, title)
     }
 }

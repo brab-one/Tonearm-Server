@@ -109,6 +109,7 @@ class TonearmServer(
                 put("recommendations", recommendations != null)
                 put("discovery", discovery != null)
                 put("history", true)
+                put("dislikes", true)
                 recommendations?.let { put("ai", it.label) }
             }
             "publish" -> {
@@ -179,7 +180,11 @@ class TonearmServer(
             "aisearch" -> {
                 val engine = recommendations ?: return error(exchange, 404, "This Tonearm server has no Ollama set up")
                 val q = query["q"]?.trim()?.take(200)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "q is required")
-                engine.toJson(engine.search(q))
+                // The answer is shared by everyone who searches the same; what this user disliked is left out here.
+                val found = engine.search(q)
+                engine.toJson(found.copy(hits = found.hits.filterNot { hit ->
+                    history.isDismissed(user, hit.artist) || hit.title?.let { history.isSongDisliked(user, hit.artist, it) } == true
+                }))
             }
             "discover" -> {
                 val engine = discovery ?: return error(exchange, 404, "Discovery is off on this Tonearm server")
@@ -214,6 +219,16 @@ class TonearmServer(
                 val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
                 history.dismiss(user, artist, query["album"]?.trim()?.take(300))
                 buildJsonObject { put("ok", true) }
+            }
+            "dislike" -> {
+                val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
+                val title = query["title"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "title is required")
+                history.dislike(user, artist, title, query["album"]?.trim()?.take(300), on = query["on"] != "false")
+                buildJsonObject { put("ok", true) }
+            }
+            "disliked" -> buildJsonObject {
+                put("songs", JsonArray(history.dislikedSongs(user).map { json.encodeToJsonElement(DislikedSong.serializer(), it) }))
+                put("artists", JsonArray(history.dismissed(user).filter { it.album == null }.map { JsonPrimitive(it.artist) }))
             }
             else -> return error(exchange, 404, "Unknown op")
         }

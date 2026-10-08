@@ -310,6 +310,36 @@ class ServerTest {
     }
 
     @Test
+    fun dislikedSongsComeBackWithTheArtistsSaidNoTo() {
+        api("dislike", bob, listOf("artist" to "Kongos feat. Someone", "title" to "Come with Me Now (Remastered)", "album" to "Lunatic"))
+        api("dismiss", bob, listOf("artist" to "Mazzy Star"))
+        api("dismiss", bob, listOf("artist" to "Tricky", "album" to "Maxinquaye"))
+        val disliked = api("disliked", bob)
+        val song = disliked["songs"]!!.jsonArray.single().jsonObject
+        assertEquals("Come with Me Now (Remastered)", song["title"]!!.jsonPrimitive.content)
+        assertEquals(listOf("Mazzy Star"), disliked["artists"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertTrue(history.isSongDisliked("bob", "Kongos", "Come With Me Now"))
+        api("dislike", bob, listOf("artist" to "Kongos", "title" to "Come with Me Now", "on" to false))
+        assertTrue(api("disliked", bob)["songs"]!!.jsonArray.isEmpty())
+        assertEquals(400, call("/connect-tonearm/api/dislike", bob + listOf("artist" to "Kongos")).first)
+    }
+
+    @Test
+    fun songsAreKeyedLikeTheAppsKeyThem() {
+        // A YouTube Music copy is the library's song, so un-disliking either takes the dislike back.
+        api("dislike", bob, listOf("artist" to "Queen", "title" to "Bohemian Rhapsody - Remastered 2011"))
+        assertTrue(history.isSongDisliked("bob", "Queen", "Bohemian Rhapsody"))
+        assertTrue(history.isSongDisliked("bob", "QueenVEVO", "Bohemian Rhapsody (Official Video)"))
+        api("dislike", bob, listOf("artist" to "Queen & David Bowie", "title" to "Bohemian Rhapsody", "on" to false))
+        assertTrue(history.dislikedSongs("bob").isEmpty())
+        // A live version is a song of its own.
+        api("dislike", bob, listOf("artist" to "Johnny Cash", "title" to "Hurt (Live)"))
+        assertFalse(history.isSongDisliked("bob", "Johnny Cash", "Hurt"))
+        api("dislike", bob, listOf("artist" to "Johnny Cash", "title" to "Hurt"))
+        assertEquals(2, history.dislikedSongs("bob").size)
+    }
+
+    @Test
     fun malojasHistoryComesOverOnceForAnAdmin() {
         api("hello", bob)
         assertTrue(history.isEmpty("bob"))

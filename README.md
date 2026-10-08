@@ -22,6 +22,8 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   Music without having them come first. Artist pages in the apps use the same source for similar artists.
 - **Not for me**: a thumbs-down on any pick in the apps keeps that artist out of both kinds of picks, until
   they're played a few times again.
+- **Disliked songs**: the apps' thumbs-down on a song is kept here, so the phone and the desktop share it. The
+  AI is told to avoid music like them, discovery weighs their artists down, and "Ask the AI" leaves them out.
 
 Everybody signs in with their own Navidrome login: the apps send the same login they use for music,
 and the server asks Navidrome whether it's valid (and whether they're an admin).

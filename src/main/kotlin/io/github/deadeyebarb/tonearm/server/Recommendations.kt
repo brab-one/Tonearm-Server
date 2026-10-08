@@ -73,6 +73,8 @@ data class Taste(
     val dismissed: List<Dismissed> = emptyList(),
     /** Earlier suggestions they went on to play. */
     val tookTo: List<String> = emptyList(),
+    /** Songs they disliked, latest first. */
+    val dislikedSongs: List<String> = emptyList(),
 )
 
 /**
@@ -216,6 +218,7 @@ class Recommendations(
         return Taste(
             albums("frequent", 40).map(::label), albums("recent", 25).map(::label), liked.distinct().take(80), library,
             lately = lately, skipped = skippers.toList(), dismissed = history?.dismissed(user).orEmpty(), tookTo = tookTo,
+            dislikedSongs = history?.dislikedSongs(user).orEmpty().sortedByDescending { it.at }.take(40).map { "${it.artist} – ${it.title}" },
         )
     }
 
@@ -235,6 +238,7 @@ class Recommendations(
             }
             if (taste.tookTo.isNotEmpty()) appendLine("\nEarlier suggestions they went on to play, so more in this direction works:\n" + taste.tookTo.joinToString("\n"))
             if (taste.skipped.isNotEmpty()) appendLine("\nArtists they mostly skip, so steer away from their sound:\n" + taste.skipped.joinToString("\n"))
+            if (taste.dislikedSongs.isNotEmpty()) appendLine("\nSongs they disliked, so avoid music like these:\n" + taste.dislikedSongs.joinToString("\n"))
             if (taste.dismissed.isNotEmpty()) {
                 appendLine("\nThey said no to these; never suggest them:")
                 appendLine(taste.dismissed.joinToString("\n") { d -> d.album?.let { "${d.artist} – $it" } ?: "${d.artist} (anything by them)" })
