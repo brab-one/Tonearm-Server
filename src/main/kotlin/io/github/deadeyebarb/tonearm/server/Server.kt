@@ -318,8 +318,8 @@ class TonearmServer(
         const val MAX_PAYLOAD = 2_000_000
         /** A device's published state: the desktop's has at most 300 songs of its queue. */
         const val MAX_STATE = 512_000
-        /** A command: a queue of a few thousand songs to play. */
-        const val MAX_COMMAND = 1_000_000
+        /** A command: the phone hands its whole queue over, which may be several thousand songs. */
+        const val MAX_COMMAND = MAX_PAYLOAD
         /** A document in the store. */
         const val MAX_DOCUMENT = 512_000
         const val MAX_WAIT_SECONDS = 25

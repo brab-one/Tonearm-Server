@@ -304,6 +304,17 @@ class ServerTest {
     }
 
     @Test
+    fun aLongQueueCanBeHandedOver() {
+        api("publish", alice(), listOf("device" to "desk"), """{"id":"desk","name":"Desk","kind":"desktop"}""")
+        // The phone's whole queue: 5,000 songs of about 300 bytes.
+        val queue = """{"type":"load","queue":[""" + List(5_000) { """{"id":"${"s".repeat(22)}$it","title":"${"t".repeat(250)}"}""" }.joinToString(",") + "]}"
+        assertTrue(queue.length > 1_000_000)
+        api("send", alice(), listOf("device" to "phone", "target" to "desk"), queue)
+        val (code, text) = call("/connect-tonearm/api/send", alice() + listOf("device" to "phone", "target" to "desk"), "x".repeat(TonearmServer.MAX_PAYLOAD + 1))
+        assertEquals(413, code, text)
+    }
+
+    @Test
     fun validLoginsAreRememberedForAWhile() {
         val login = listOf("u" to "alice", "p" to "wonderland")
         api("hello", login)
