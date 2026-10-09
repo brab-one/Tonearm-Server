@@ -426,6 +426,31 @@ class ServerTest {
     }
 
     @Test
+    fun listeningGoesByWeekWithAlbumsAndPages() {
+        val start = 1_760_000_000_000L
+        val plays = (0 until 6).joinToString(",", "[", "]") { i ->
+            val album = if (i == 5) "" else ""","album":"Tones${if (i % 2 == 0) " (Deluxe Edition)" else ""}""""
+            """{"at":${start + i * 3_600_000L},"artist":"The Oscillators","title":"Song $i"$album,"durationMs":120000,"listenedMs":120000,"source":"${if (i == 4) "youtube" else "library"}"}"""
+        }
+        api("played", bob, body = plays)
+        val week = api("listening", bob, listOf("from" to start, "to" to start + 5 * 3_600_000L, "artists" to 10, "albums" to 10, "recent" to 2))
+        assertEquals(start + 5 * 3_600_000L, week["to"]!!.jsonPrimitive.long)
+        assertEquals(5, week["plays"]!!.jsonPrimitive.int)
+        assertEquals(10, week["minutes"]!!.jsonPrimitive.int)
+        val album = week["albums"]!!.jsonArray.single().jsonObject
+        assertEquals(5, album["plays"]!!.jsonPrimitive.int)
+        val recent = week["recent"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("Song 4", "Song 3"), recent.map { it["title"]!!.jsonPrimitive.content })
+        assertEquals("youtube", recent.first()["source"]!!.jsonPrimitive.content)
+        assertEquals("Tones (Deluxe Edition)", recent.first()["album"]!!.jsonPrimitive.content)
+        val before = recent.last()["at"]!!.jsonPrimitive.long
+        val next = api("listening", bob, listOf("from" to start, "to" to start + 5 * 3_600_000L, "recent" to 2, "before" to before))
+        assertEquals(listOf("Song 2", "Song 1"), next["recent"]!!.jsonArray.map { it.jsonObject["title"]!!.jsonPrimitive.content })
+        // The old way still works: everything there is.
+        assertEquals(6, api("listening", bob, listOf("days" to 100_000))["plays"]!!.jsonPrimitive.int)
+    }
+
+    @Test
     fun navidromeBeingDownIsABadGateway() {
         navidrome.stop(0)
         assertEquals(502, call("/connect-tonearm/api/hello", alice()).first)

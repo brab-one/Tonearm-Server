@@ -48,6 +48,47 @@ class HistoryTest {
     }
 
     @Test
+    fun aWeekIsFromUpToTo() {
+        val start = 1_760_000_000_000L
+        val hour = 3_600_000L
+        fun at(h: Long, title: String, album: String? = "Hi-Res Tones", listenedS: Long = 120, source: String = "library") =
+            Played(start + h * hour, "The Oscillators", title, album, durationMs = 120_000, listenedMs = listenedS * 1000, source = source)
+        History(dir).add("alice", listOf(
+            at(-1, "Before"), at(0, "Low Hum"), at(1, "Middle C", "Hi-Res Tones (Deluxe Edition)"), at(2, "Skipped", listenedS = 3),
+            at(3, "No Album", null), at(4, "Live", "Live at Home", source = "youtube"), at(167, "Last"), at(168, "Next Week"),
+        ))
+        val history = History(dir)
+        val week = history.listening("alice", start, artists = 10, songs = 0, recent = 100, to = start + 168 * hour, albums = 10)
+        assertEquals(start + 168 * hour, week.to)
+        assertEquals(listOf("Last", "Live", "No Album", "Middle C", "Low Hum"), week.recent.map { it.title })
+        assertEquals(5, week.plays)
+        assertEquals(10, week.minutes)
+        // The deluxe edition is the same album; plays without one aren't in the albums.
+        assertEquals(listOf("Hi-Res Tones" to 3, "Live at Home" to 1), week.albums.map { it.album to it.plays })
+        assertEquals("Hi-Res Tones (Deluxe Edition)", week.recent.first { it.title == "Middle C" }.album)
+        assertEquals("youtube", week.recent.first { it.title == "Live" }.source)
+        assertEquals(null, week.recent.first { it.title == "No Album" }.album)
+        // Paging: what came before the oldest one shown, without overlap.
+        val first = history.listening("alice", start, 0, 0, recent = 2, to = start + 168 * hour)
+        val next = history.listening("alice", start, 0, 0, recent = 2, to = start + 168 * hour, before = first.recent.last().at)
+        assertEquals(listOf("Last", "Live"), first.recent.map { it.title })
+        assertEquals(listOf("No Album", "Middle C"), next.recent.map { it.title })
+        assertEquals(5, next.plays)
+        assertTrue(history.listening("alice", start, 10, 0, 0).albums.isEmpty())
+    }
+
+    @Test
+    fun sinceCopiesOnlyTheTail() {
+        val history = History(dir)
+        history.add("alice", (1..50).map { Played(1_000L * it, "Sia", "Song $it", durationMs = 200_000, listenedMs = 200_000) })
+        assertEquals((41..50).map { "Song $it" }, history.since("alice", 41_000).map { it.title })
+        assertEquals((41..50).map { "Song $it" }, history.since("alice", 40_500).map { it.title })
+        assertEquals(50, history.since("alice", 0).size)
+        assertTrue(history.since("alice", 60_000).isEmpty())
+        assertTrue(history.since("bob", 0).isEmpty())
+    }
+
+    @Test
     fun dismissedAlbumsAndArtists() {
         val history = History(dir)
         history.dismiss("alice", "Tricky", "Maxinquaye")

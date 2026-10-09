@@ -64,14 +64,22 @@ data class ArtistCount(val artist: String, val plays: Int, val skips: Int = 0, v
 data class SongCount(val artist: String, val title: String, val album: String? = null, val plays: Int)
 
 @Serializable
-data class RecentPlay(val artist: String, val title: String, val at: Long)
+data class AlbumCount(val artist: String, val album: String, val plays: Int, val lastPlayed: Long = 0)
+
+@Serializable
+data class RecentPlay(val artist: String, val title: String, val at: Long, val album: String? = null, val source: String? = null)
 
 /** Someone's listening over a time span, most played first. */
 @Serializable
 data class Listening(
     val since: Long = 0,
+    /** Where the span ends (not included). */
+    val to: Long = 0,
     val plays: Int = 0,
+    /** Time listened in the plays that count. */
+    val minutes: Int = 0,
     val artists: List<ArtistCount> = emptyList(),
+    val albums: List<AlbumCount> = emptyList(),
     val songs: List<SongCount> = emptyList(),
     val recent: List<RecentPlay> = emptyList(),
 )
@@ -120,11 +128,27 @@ class History(dataDir: File) {
 
     fun played(user: String): List<Played> = synchronized(lock(user)) { playsOf(user).toList() }
 
-    fun isEmpty(user: String) = played(user).isEmpty()
+    /** The user's plays from [from] on, oldest first: only that end of the history is copied. */
+    fun since(user: String, from: Long): List<Played> = synchronized(lock(user)) {
+        val list = playsOf(user)
+        // The list is kept in order of time: the first play at or after [from], by halves.
+        var low = 0
+        var high = list.size
+        while (low < high) {
+            val mid = (low + high) ushr 1
+            if (list[mid].at < from) low = mid + 1 else high = mid
+        }
+        ArrayList(list.subList(low, list.size))
+    }
 
-    /** The user's listening since [since] (all of it for 0): top artists and songs, and the latest plays. */
-    fun listening(user: String, since: Long, artists: Int, songs: Int, recent: Int): Listening {
-        val all = played(user).filter { it.at >= since }
+    fun isEmpty(user: String) = synchronized(lock(user)) { playsOf(user).isEmpty() }
+
+    /**
+     * The user's listening from [since] (all of it for 0) up to [to] (not included): top artists, albums and songs, and
+     * the latest plays, or ([before]) the ones before those for paging.
+     */
+    fun listening(user: String, since: Long, artists: Int, songs: Int, recent: Int, to: Long = Long.MAX_VALUE, albums: Int = 0, before: Long? = null): Listening {
+        val all = since(user, since).filter { it.at < to }
         val counted = all.filter { it.counts }
         val byArtist = all.groupBy { normalize(it.mainArtist) }.map { (_, plays) ->
             val shown = plays.groupingBy { it.mainArtist }.eachCount().maxBy { it.value }.key
@@ -134,12 +158,22 @@ class History(dataDir: File) {
             val last = plays.last()
             SongCount(last.artist, last.title, last.album, plays.size)
         }.sortedByDescending { it.plays }
+        // An album counts with its "(Deluxe Edition)" and under the name it's played as most.
+        val byAlbum = if (albums == 0) emptyList() else counted.filter { !it.album.isNullOrBlank() }
+            .groupBy { normalize(it.mainArtist) + "|" + Recommendations.looseTitle(it.album!!) }.map { (_, plays) ->
+                val shown = plays.groupingBy { it.mainArtist to it.album!! }.eachCount().maxBy { it.value }.key
+                AlbumCount(shown.first, shown.second, plays.size, plays.maxOf { it.at })
+            }.sortedWith(compareByDescending<AlbumCount> { it.plays }.thenByDescending { it.lastPlayed })
+        val latest = if (before == null) counted else counted.filter { it.at < before }
         return Listening(
             since = since,
+            to = to,
             plays = counted.size,
+            minutes = (counted.sumOf { it.listenedMs } / 60_000).toInt(),
             artists = byArtist.take(artists),
+            albums = byAlbum.take(albums),
             songs = bySong.take(songs),
-            recent = counted.takeLast(recent).reversed().map { RecentPlay(it.artist, it.title, it.at) },
+            recent = latest.takeLast(recent).reversed().map { RecentPlay(it.artist, it.title, it.at, it.album, it.source) },
         )
     }
 

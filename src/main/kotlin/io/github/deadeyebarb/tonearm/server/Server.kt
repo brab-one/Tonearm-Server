@@ -118,6 +118,7 @@ class TonearmServer(
                 put("discovery", discovery != null)
                 put("history", true)
                 put("dislikes", true)
+                put("stats", true)
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
@@ -235,10 +236,16 @@ class TonearmServer(
                 buildJsonObject { put("ok", true); put("added", history.add(user, plays)) }
             }
             "listening" -> {
+                val now = System.currentTimeMillis()
+                // A calendar week or month from the app (from, to), or the last few days.
                 val days = query["days"]?.toLongOrNull()?.takeIf { it > 0 }
-                val since = days?.let { System.currentTimeMillis() - it * 24 * 3_600_000L } ?: 0
+                val since = query["from"]?.toLongOrNull() ?: days?.let { now - it * 24 * 3_600_000L } ?: 0
+                val to = query["to"]?.toLongOrNull() ?: now
                 fun limit(name: String, default: Int) = (query[name]?.toIntOrNull() ?: default).coerceIn(0, 1_000)
-                history.toJson(history.listening(user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0)))
+                history.toJson(history.listening(
+                    user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0),
+                    to = to, albums = limit("albums", 0), before = query["before"]?.toLongOrNull(),
+                ))
             }
             "dismiss" -> {
                 val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
