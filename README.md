@@ -42,7 +42,8 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
 - **Daily mixes**: up to three mixes of 30 songs a day for each user, from the artists they played in the last
   90 days and liked, grouped by genre (electronic, jazz, metal…) with library artists like them; nothing from
   yesterday's mixes or the last three days' plays, nothing disliked. The first time an app asks on a new day they're
-  made (a few seconds); a day starts at 04:00 in the app's time zone.
+  made (a few seconds); a day starts at 04:00 in the app's time zone, and an app where it's still the day before
+  gets the new day's mixes.
 - **Continue where you left off**: the server keeps each user's last song, place and queue from their devices,
   also after the desktop quits or the server restarts, so the phone in the car can carry on where the desktop
   stopped.

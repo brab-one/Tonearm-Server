@@ -392,9 +392,15 @@ class MixesTest {
         assertEquals("2026-10-10", today.day)
         assertTrue(today.ids().isNotEmpty())
         assertTrue(today.ids().none { it in yesterday.ids() }, "${yesterday.ids()} then ${today.ids()}")
-        // In UTC it's 02:01, so still the 9th there.
+        // In UTC it's 02:01, so still the 9th there: a device in UTC gets the 10th's, and they're not made again.
         assertEquals("2026-10-09", Mixes.dayOf(now, ZoneId.of("UTC")))
-        assertEquals("2026-10-09", mixes.ready(ZoneId.of("UTC")).day)
+        synchronized(calls) { calls.clear() }
+        val utc = mixes.daily("alice", login, ZoneId.of("UTC"))
+        assertFalse(utc.running)
+        assertEquals("2026-10-10", utc.day)
+        assertEquals(today.ids(), utc.ids())
+        assertTrue(synchronized(calls) { calls.isEmpty() })
+        assertEquals(today.ids(), mixes.daily("alice", login, VIENNA).ids())
     }
 
     @Test

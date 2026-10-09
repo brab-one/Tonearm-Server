@@ -363,22 +363,24 @@ class Mixes(
 
     /**
      * Today's daily mixes; a day starts at 04:00 in [zone]. The first call of a day makes them in the background with this
-     * call's login ([DailyMixes.running] until then; the apps ask again). Songs disliked since are left out.
+     * call's login ([DailyMixes.running] until then; the apps ask again). A day never goes back: a device whose day hasn't
+     * started yet (in another time zone) gets the ones already made for the next. Songs disliked since are left out.
      */
     fun daily(user: String, login: Map<String, String>, zone: ZoneId): DailyMixes {
         val day = dayOf(clock(), zone)
         failed[user]?.takeIf { it.day == day && clock() - it.at < RETRY_DAILY_MS }?.let { return DailyMixes(day, problem = it.problem) }
         val stored = loadDaily(user)
-        if (stored?.day == day && user !in building) {
+        // yyyy-MM-dd: later days sort later.
+        if (stored != null && stored.day >= day && user !in building) {
             val rules = rules(user)
-            return DailyMixes(day, problem = stored.problem, mixes = stored.mixes.map { m ->
+            return DailyMixes(stored.day, problem = stored.problem, mixes = stored.mixes.map { m ->
                 Mix(m.id, title = m.title, subtitle = m.subtitle, songs = m.songs.map(::LibrarySong).filter(rules::allows))
             })
         }
         if (building.add(user)) {
             dailyWorker.execute {
                 try {
-                    if (loadDaily(user)?.day != day) saveDaily(user, buildDaily(user, login, day))
+                    if (loadDaily(user)?.day?.let { it >= day } != true) saveDaily(user, buildDaily(user, login, day))
                     failed.remove(user)
                 } catch (e: Exception) {
                     val problem = "Couldn't make your daily mixes: ${e.message ?: e.javaClass.simpleName}"
