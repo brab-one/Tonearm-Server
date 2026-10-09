@@ -88,13 +88,20 @@ class TonearmServer(
         }
         val user = login.user
         malojaImport?.invoke(user, login.admin)
-        val bytes = exchange.requestBody.use { it.readNBytes(MAX_PAYLOAD + 1) }
-        if (bytes.size > MAX_PAYLOAD) return error(exchange, 413, "Payload too large")
+        val op = path.removePrefix("api/")
+        // Device states and commands are held in memory, so they get less room than the rest.
+        val limit = when (op) {
+            "publish" -> MAX_STATE
+            "send" -> MAX_COMMAND
+            "put" -> MAX_DOCUMENT
+            else -> MAX_PAYLOAD
+        }
+        val bytes = exchange.requestBody.use { it.readNBytes(limit + 1) }
+        if (bytes.size > limit) return error(exchange, 413, "Payload too large (at most ${limit / 1000} KB here)")
         if (!path.startsWith("api/")) {
             val call = ProxyCall(exchange.requestMethod.uppercase(), path.substringAfter('/'), exchange.requestURI.rawQuery, exchange.requestHeaders.getFirst("Content-Type"), bytes)
             return relay(exchange, lidarr?.handle(call, login.admin, user) ?: Upstream.error(404, "This Tonearm server has no Lidarr set up"))
         }
-        val op = path.removePrefix("api/")
         val payload = bytes.decodeToString()
         val device = query["device"]
         val users = hub.of(user)
@@ -145,7 +152,8 @@ class TonearmServer(
             "send" -> {
                 val target = query["target"]
                 if (device.isNullOrEmpty() || target.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device, target and payload are required")
-                buildJsonObject { put("ok", true); put("seq", users.send(device, target, payload)) }
+                val seq = users.send(device, target, payload) ?: return error(exchange, 404, "That device isn't connected to the Tonearm server")
+                buildJsonObject { put("ok", true); put("seq", seq) }
             }
             "poll" -> {
                 if (device.isNullOrEmpty()) return error(exchange, 400, "device is required")
@@ -172,6 +180,7 @@ class TonearmServer(
                 val ifVersion = query["ifVersion"]?.toLongOrNull()
                 if (!Store.validKey(key) || ifVersion == null || payload.isEmpty()) return error(exchange, 400, "key, ifVersion and payload are required")
                 val (ok, current) = store.put(user, key!!, payload, ifVersion)
+                    ?: return error(exchange, 413, "That's more than the Tonearm server keeps for you (${Store.MAX_KEYS} documents, ${Store.MAX_CHARS / 1_000_000} MB)")
                 buildJsonObject {
                     put("ok", ok)
                     put("conflict", !ok)
@@ -297,6 +306,12 @@ class TonearmServer(
     companion object {
         const val PROTOCOL = 2
         const val MAX_PAYLOAD = 2_000_000
+        /** A device's published state: the desktop's has at most 300 songs of its queue. */
+        const val MAX_STATE = 512_000
+        /** A command: a queue of a few thousand songs to play. */
+        const val MAX_COMMAND = 1_000_000
+        /** A document in the store. */
+        const val MAX_DOCUMENT = 512_000
         const val MAX_WAIT_SECONDS = 25
     }
 }

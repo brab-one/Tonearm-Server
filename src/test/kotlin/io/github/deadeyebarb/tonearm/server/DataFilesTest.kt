@@ -17,7 +17,7 @@ class DataFilesTest {
     fun aFolderThatWentAwayIsMadeAgain() {
         val store = Store(File(dir, "store"))
         File(dir, "store").deleteRecursively()
-        assertTrue(store.put("brab", "weekly-picks", "{}", 0).first)
+        assertTrue(store.put("brab", "weekly-picks", "{}", 0)!!.first)
         assertEquals("{}", Store(File(dir, "store")).get("brab", "weekly-picks").value)
     }
 

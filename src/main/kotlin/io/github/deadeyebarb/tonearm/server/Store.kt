@@ -10,7 +10,7 @@ import java.net.URLEncoder
 /**
  * Small JSON documents the apps share, per user (e.g. likes of songs that aren't in the library yet),
  * saved in one file per user. A write only goes through when it names the current version, so two
- * devices never overwrite each other.
+ * devices never overwrite each other. Each user keeps at most [MAX_KEYS] documents of [MAX_CHARS] together.
  */
 class Store(private val dir: File) {
     @Serializable
@@ -27,15 +27,20 @@ class Store(private val dir: File) {
     @Synchronized
     fun get(user: String, key: String): Entry = load(user)[key] ?: Entry()
 
-    /** Saves [value] if the stored version is still [ifVersion]; returns whether it did and what's stored now. */
+    /**
+     * Saves [value] if the stored version is still [ifVersion]; returns whether it did and what's stored now. Null when
+     * it's more than a user may keep. Throws when it can't be saved, and nothing changes then.
+     */
     @Synchronized
-    fun put(user: String, key: String, value: String, ifVersion: Long): Pair<Boolean, Entry> {
+    fun put(user: String, key: String, value: String, ifVersion: Long): Pair<Boolean, Entry>? {
         val entries = load(user)
         val current = entries[key] ?: Entry()
         if (current.version != ifVersion) return false to current
         val next = Entry(current.version + 1, value)
+        val all = entries + (key to next)
+        if (all.size > MAX_KEYS || all.values.sumOf { it.value?.length ?: 0 } > MAX_CHARS) return null
+        save(user, all)
         entries[key] = next
-        save(user, entries)
         return true to next
     }
 
@@ -53,6 +58,9 @@ class Store(private val dir: File) {
     private fun save(user: String, entries: Map<String, Entry>) = DataFiles.write(file(user), json.encodeToString(serializer, entries))
 
     companion object {
+        const val MAX_KEYS = 50
+        /** Characters in all of a user's documents together. */
+        const val MAX_CHARS = 2_000_000
         private val KEY = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
         fun validKey(key: String?) = key != null && KEY.matches(key)
     }

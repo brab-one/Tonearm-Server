@@ -258,6 +258,15 @@ class ServerTest {
     }
 
     @Test
+    fun devicesGetLessRoomThanTheRest() {
+        val (code, text) = call("/connect-tonearm/api/publish", alice() + listOf("device" to "desk"), "x".repeat(TonearmServer.MAX_STATE + 1))
+        assertEquals(413, code, text)
+        assertEquals(404, call("/connect-tonearm/api/send", alice() + listOf("device" to "phone", "target" to "nobody"), """{"type":"pause"}""").first)
+        repeat(Store.MAX_KEYS) { api("put", alice(), listOf("key" to "doc-$it", "ifVersion" to 0), "{}") }
+        assertEquals(413, call("/connect-tonearm/api/put", alice() + listOf("key" to "one-more", "ifVersion" to 0), "{}").first)
+    }
+
+    @Test
     fun validLoginsAreRememberedForAWhile() {
         val login = listOf("u" to "alice", "p" to "wonderland")
         api("hello", login)
