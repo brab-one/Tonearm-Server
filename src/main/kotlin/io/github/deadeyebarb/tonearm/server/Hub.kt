@@ -65,6 +65,11 @@ class UserHub {
 
     private fun waiting(device: String, after: Long) = inboxes[device].orEmpty().filter { it.seq > after }
 
+    /** Whether [device] published or polled in the last [ONLINE_WINDOW_MS]. */
+    fun isOnline(device: String, now: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        devices[device]?.let { now - it.lastSeen < ONLINE_WINDOW_MS } == true
+    }
+
     fun forget(device: String): Unit = synchronized(lock) {
         devices.remove(device)
         inboxes.remove(device)

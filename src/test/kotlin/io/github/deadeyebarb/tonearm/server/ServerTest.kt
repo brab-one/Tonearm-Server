@@ -57,7 +57,7 @@ class ServerTest {
                 else if (ex.requestURI.path.endsWith("/tokenInfo.view")) """{"subsonic-response":{"status":"ok","tokenInfo":{"username":"Bob"}}}"""
                 else if (ex.requestURI.path.endsWith("/getUser.view") && getUserBroken) "<html>502 Bad Gateway</html>"
                 else if (ex.requestURI.path.endsWith("/getUser.view")) """{"subsonic-response":{"status":"ok","user":{"username":"${q["username"]}","adminRole":${q["username"]?.lowercase() == "alice"}}}}"""
-                else """{"subsonic-response":{"status":"ok"}}"""
+                else library(ex.requestURI.path.substringAfterLast('/').removeSuffix(".view"), q)
                 val bytes = body.encodeToByteArray()
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
@@ -93,6 +93,7 @@ class ServerTest {
             LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), requestsForEveryone = true),
             history = history,
             malojaImport = { user, admin -> if (admin) history.importMaloja(user, up, "maloja-secret", http) },
+            mixes = Mixes(LibraryReader("http://127.0.0.1:${navidrome.address.port}"), history, null, null, dataDir),
         ).start()
     }
 
@@ -101,6 +102,22 @@ class ServerTest {
         server.stop()
         navidrome.stop(0)
         upstream.stop(0)
+    }
+
+    /** Alice's library: one artist, one album of four songs, all like each other. */
+    private fun library(method: String, q: Map<String, String>): String {
+        fun song(n: Int) = """{"id":"s$n","title":"Song $n","artist":"The Oscillators","artistId":"ar1","album":"Tones","albumId":"al1","genre":"Electronic","year":2024,"size":${1000 + n},"replayGain":{"trackGain":-3.0}}"""
+        val songs = (1..4).joinToString(",") { song(it) }
+        val body = when (method) {
+            "getArtists" -> """"artists":{"index":[{"artist":[{"id":"ar1","name":"The Oscillators"}]}]}"""
+            "getArtist" -> """"artist":{"id":"ar1","name":"The Oscillators","album":[{"id":"al1","name":"Tones","genre":"Electronic"}]}"""
+            "getAlbum" -> """"album":{"id":"al1","song":[$songs]}"""
+            "getSong" -> """"song":${song(q["id"]?.removePrefix("s")?.toIntOrNull() ?: 1)}"""
+            "getSimilarSongs2" -> """"similarSongs2":{"song":[$songs]}"""
+            "getRandomSongs" -> """"randomSongs":{"song":[$songs]}"""
+            else -> return """{"subsonic-response":{"status":"ok"}}"""
+        }
+        return """{"subsonic-response":{"status":"ok",$body}}"""
     }
 
     private fun md5(text: String) = MessageDigest.getInstance("MD5").digest(text.encodeToByteArray()).joinToString("") { "%02x".format(it) }
@@ -471,6 +488,96 @@ class ServerTest {
         assertEquals(listOf("Sia", "Kongos"), listening.artists.map { it.artist }.sorted().reversed())
         assertEquals("Rewrite", listening.songs.first { it.artist == "Sia" }.album)
         assertEquals(null, history.importMaloja("alice", "http://127.0.0.1:${upstream.address.port}", null, http))
+    }
+
+    @Test
+    fun helloSaysWhatsNewInThisVersion() {
+        val hello = api("hello", alice())
+        for (flag in listOf("radio", "dailyMixes", "resume", "stats")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
+        // Mixes from a sentence need an AI, and this server has none.
+        assertEquals("false", hello["mix"]!!.jsonPrimitive.content)
+        assertEquals(404, call("/connect-tonearm/api/mix", alice() + listOf("prompt" to "mellow jazz")).first)
+        // A server built without them (as tests do) says so too.
+        val bare = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test").start()
+        try {
+            val (_, text) = http.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:${bare.boundPort}/connect-tonearm/api/hello?apiKey=bobkey")).POST(HttpRequest.BodyPublishers.noBody()).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            ).let { it.statusCode() to it.body() }
+            assertEquals("false", Json.parseToJsonElement(text).jsonObject["radio"]!!.jsonPrimitive.content)
+        } finally {
+            bare.stop()
+        }
+    }
+
+    @Test
+    fun radioLeavesOutWhatsQueued() {
+        val (code, text) = call("/connect-tonearm/api/radio", alice() + listOf("seed" to "album"))
+        assertEquals(400, code)
+        assertEquals("seed has to be song or picks", Json.parseToJsonElement(text).jsonObject["error"]!!.jsonPrimitive.content)
+        assertEquals(400, call("/connect-tonearm/api/radio", alice() + listOf("seed" to "song", "artist" to "The Oscillators")).first)
+        assertEquals(400, call("/connect-tonearm/api/radio", alice() + listOf("seed" to "song", "id" to "s1"), "not json").first)
+        val radio = api("radio", alice(), listOf("seed" to "song", "id" to "s1", "count" to 5), """{"exclude":["yt/abc","lib/s1","lib/s3"]}""")
+        assertEquals("Radio · Song 1", radio["title"]!!.jsonPrimitive.content)
+        val songs = radio["songs"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(setOf("s2", "s4"), songs.map { it["id"]!!.jsonPrimitive.content }.toSet())
+        // Navidrome's song objects as they came, size and replay gain included.
+        assertEquals(1002, songs.first { it["id"]!!.jsonPrimitive.content == "s2" }["size"]!!.jsonPrimitive.int)
+        assertTrue("replayGain" in songs.first())
+        assertEquals("false", radio["more"]!!.jsonPrimitive.content)
+        assertTrue(radio["problem"] is kotlinx.serialization.json.JsonNull)
+    }
+
+    @Test
+    fun dailyMixesNeedARealTimeZone() {
+        assertEquals(400, call("/connect-tonearm/api/dailymixes", alice() + listOf("tz" to "Mars/Olympus")).first)
+        val daily = api("dailymixes", alice(), listOf("tz" to "Europe/Vienna"))
+        assertTrue("day" in daily && "mixes" in daily)
+    }
+
+    @Test
+    fun listeningGoesByWeekWithAlbumsAndPages() {
+        val start = 1_760_000_000_000L
+        val plays = (0 until 6).joinToString(",", "[", "]") { i ->
+            val album = if (i == 5) "" else ""","album":"Tones${if (i % 2 == 0) " (Deluxe Edition)" else ""}""""
+            """{"at":${start + i * 3_600_000L},"artist":"The Oscillators","title":"Song $i"$album,"durationMs":120000,"listenedMs":120000,"source":"${if (i == 4) "youtube" else "library"}"}"""
+        }
+        api("played", bob, body = plays)
+        val week = api("listening", bob, listOf("from" to start, "to" to start + 5 * 3_600_000L, "artists" to 10, "albums" to 10, "recent" to 2))
+        assertEquals(start + 5 * 3_600_000L, week["to"]!!.jsonPrimitive.long)
+        assertEquals(5, week["plays"]!!.jsonPrimitive.int)
+        assertEquals(10, week["minutes"]!!.jsonPrimitive.int)
+        val album = week["albums"]!!.jsonArray.single().jsonObject
+        assertEquals(5, album["plays"]!!.jsonPrimitive.int)
+        val recent = week["recent"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("Song 4", "Song 3"), recent.map { it["title"]!!.jsonPrimitive.content })
+        assertEquals("youtube", recent.first()["source"]!!.jsonPrimitive.content)
+        assertEquals("Tones (Deluxe Edition)", recent.first()["album"]!!.jsonPrimitive.content)
+        val before = recent.last()["at"]!!.jsonPrimitive.long
+        val next = api("listening", bob, listOf("from" to start, "to" to start + 5 * 3_600_000L, "recent" to 2, "before" to before))
+        assertEquals(listOf("Song 2", "Song 1"), next["recent"]!!.jsonArray.map { it.jsonObject["title"]!!.jsonPrimitive.content })
+        // The old way still works: everything there is.
+        assertEquals(6, api("listening", bob, listOf("days" to 100_000))["plays"]!!.jsonPrimitive.int)
+    }
+
+    @Test
+    fun theDesktopsLastSongOutlivesItsGoodbye() {
+        val state = """{"id":"desk-1","name":"Tonearm on desk","kind":"desktop","playback":{"playing":true,"positionMs":20000,"index":1,"queue":[{"id":"s1"},{"id":"s2"}]}}"""
+        api("publish", alice(), listOf("device" to "desk-1"), state)
+        val online = api("resume", alice(), listOf("device" to "phone-x"))["handoff"]!!.jsonObject
+        assertEquals("true", online["online"]!!.jsonPrimitive.content)
+        assertEquals("true", online["playing"]!!.jsonPrimitive.content)
+        api("forget", alice(), listOf("device" to "desk-1"))
+        val handoff = api("resume", alice(), listOf("device" to "phone-x"))["handoff"]!!.jsonObject
+        assertEquals("desk-1", handoff["device"]!!.jsonPrimitive.content)
+        assertEquals("Tonearm on desk", handoff["name"]!!.jsonPrimitive.content)
+        assertEquals("false", handoff["online"]!!.jsonPrimitive.content)
+        assertEquals("false", handoff["playing"]!!.jsonPrimitive.content)
+        assertEquals(state, handoff["state"]!!.jsonPrimitive.content)
+        assertTrue(handoff["playedAt"]!!.jsonPrimitive.long > 0)
+        // Not for the desktop itself, and nobody else sees it.
+        assertTrue(api("resume", alice(), listOf("device" to "desk-1"))["handoff"] is kotlinx.serialization.json.JsonNull)
+        assertTrue(api("resume", bob, listOf("device" to "phone-x"))["handoff"] is kotlinx.serialization.json.JsonNull)
     }
 
     @Test

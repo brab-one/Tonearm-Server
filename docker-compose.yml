@@ -3,7 +3,7 @@ services:
     image: ghcr.io/brab-one/tonearm-server:latest
     container_name: tonearm-server
     restart: unless-stopped
-    # Every setting in the stack's .env reaches the server as it is (LIDARR_URL, AI_MODEL, …; the README
+    # Every setting in the stack's .env reaches the server as it is (LIDARR_URL, AI_MODEL, TZ, …; the README
     # lists them all), so a new one never needs a change here.
     env_file:
       - path: .env

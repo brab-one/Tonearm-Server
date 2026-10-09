@@ -95,6 +95,9 @@ interface Ai {
     }
 }
 
+/** Which AI answers, for the apps ("Ollama gemma4:26b", "Claude claude-opus-5-5"). */
+val Ai.label: String get() = (if (name == "The AI") "" else "$name ") + model
+
 private val aiJson = Json { ignoreUnknownKeys = true }
 private val defaultHttp: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 

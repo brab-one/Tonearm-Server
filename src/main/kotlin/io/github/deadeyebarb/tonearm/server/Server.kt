@@ -10,11 +10,14 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.URLDecoder
+import java.time.ZoneId
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -38,6 +41,10 @@ class TonearmServer(
     private val malojaImport: ((user: String, admin: Boolean) -> Unit)? = null,
     /** Proxies whose word on who they forwarded a request for is taken (X-Forwarded-For, X-Real-IP). */
     private val trustedProxies: List<AddressRange> = AddressRange.LOCAL,
+    /** Radio, mixes from a sentence and daily mixes; none in tests that don't need them. */
+    private val mixes: Mixes? = null,
+    /** Where each device left off, for Continue from the desktop. */
+    private val handoffs: Handoffs = Handoffs(dataDir),
 ) {
     private val base = "/" + basePath.trim('/')
     private val json = Json { ignoreUnknownKeys = true }
@@ -118,6 +125,11 @@ class TonearmServer(
                 put("discovery", discovery != null)
                 put("history", true)
                 put("dislikes", true)
+                put("stats", true)
+                put("resume", true)
+                put("radio", mixes != null)
+                put("mix", mixes?.hasAi == true)
+                put("dailyMixes", mixes != null)
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
@@ -137,7 +149,9 @@ class TonearmServer(
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")
-                buildJsonObject { put("ok", true); put("seq", users.publish(device, payload)) }
+                val seq = users.publish(device, payload)
+                handoffs.record(user, device, payload)
+                buildJsonObject { put("ok", true); put("seq", seq) }
             }
             "devices" -> buildJsonObject {
                 put("devices", JsonArray(users.list().map { d ->
@@ -166,9 +180,13 @@ class TonearmServer(
                 }
             }
             "forget" -> {
-                if (!device.isNullOrEmpty()) users.forget(device)
+                if (!device.isNullOrEmpty()) {
+                    users.forget(device)
+                    handoffs.gone(user, device)
+                }
                 buildJsonObject { put("ok", true) }
             }
+            "resume" -> handoffs.toJson(handoffs.latest(user, device?.ifEmpty { null }) { users.isOnline(it) })
             "get" -> {
                 val key = query["key"]
                 if (!Store.validKey(key)) return error(exchange, 400, "a valid key is required")
@@ -235,10 +253,49 @@ class TonearmServer(
                 buildJsonObject { put("ok", true); put("added", history.add(user, plays)) }
             }
             "listening" -> {
+                val now = System.currentTimeMillis()
+                // A calendar week or month from the app (from, to), or the last few days.
                 val days = query["days"]?.toLongOrNull()?.takeIf { it > 0 }
-                val since = days?.let { System.currentTimeMillis() - it * 24 * 3_600_000L } ?: 0
+                val since = query["from"]?.toLongOrNull() ?: days?.let { now - it * 24 * 3_600_000L } ?: 0
+                val to = query["to"]?.toLongOrNull() ?: now
                 fun limit(name: String, default: Int) = (query[name]?.toIntOrNull() ?: default).coerceIn(0, 1_000)
-                history.toJson(history.listening(user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0)))
+                history.toJson(history.listening(
+                    user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0),
+                    to = to, albums = limit("albums", 0), before = query["before"]?.toLongOrNull(),
+                ))
+            }
+            "radio" -> {
+                val engine = mixes ?: return error(exchange, 404, "This Tonearm server has no radio")
+                val seed = query["seed"]
+                if (seed != Mixes.SONG && seed != Mixes.PICKS) return error(exchange, 400, "seed has to be song or picks")
+                fun param(name: String) = query[name]?.trim()?.take(300)?.ifEmpty { null }
+                val id = param("id")
+                val artist = param("artist")
+                val title = param("title")
+                if (seed == Mixes.SONG && id == null && (artist == null || title == null)) return error(exchange, 400, "seed=song needs id, or artist and title")
+                // The queue, oldest first, as the apps key songs.
+                val exclude = if (payload.isBlank()) emptyList() else try {
+                    (json.parseToJsonElement(payload).jsonObject["exclude"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                } catch (e: Exception) {
+                    return error(exchange, 400, "the body has to be {\"exclude\": [song keys]}")
+                }
+                val count = (query["count"]?.toIntOrNull() ?: 25).coerceIn(5, 50)
+                try {
+                    engine.toJson(engine.radio(user, NavidromeAuth.loginOf(query), seed, id, artist, title, exclude.takeLast(Mixes.MAX_EXCLUDE), count))
+                } catch (e: LibraryException) {
+                    return error(exchange, 502, "Couldn't read your library: ${e.message}")
+                }
+            }
+            "mix" -> {
+                val engine = mixes?.takeIf { it.hasAi } ?: return error(exchange, 404, "This Tonearm server has no AI set up")
+                val prompt = query["prompt"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "prompt is required")
+                engine.toJson(engine.mix(user, NavidromeAuth.loginOf(query), prompt, refresh = query["refresh"] == "true"))
+            }
+            "dailymixes" -> {
+                val engine = mixes ?: return error(exchange, 404, "This Tonearm server has no daily mixes")
+                val tz = query["tz"]?.trim()?.takeIf { it.isNotEmpty() }
+                val zone = if (tz == null) ZoneId.systemDefault() else runCatching { ZoneId.of(tz) }.getOrNull() ?: return error(exchange, 400, "tz isn't a time zone")
+                engine.toJson(engine.daily(user, NavidromeAuth.loginOf(query), zone))
             }
             "dismiss" -> {
                 val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
