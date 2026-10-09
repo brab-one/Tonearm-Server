@@ -285,6 +285,18 @@ class MixesTest {
     }
 
     @Test
+    fun picksRadioGoesOnWithLikedArtistsThatAreLikeEachOther() {
+        // Midnight Quartet and Brush Trio are each other's only similar artists: not just the two likes, then nothing.
+        starred["al5-1"] = now - 2 * DAY
+        starred["al6-1"] = now - 2 * DAY
+        val radio = mixes().radio("alice", login, Mixes.PICKS, null, null, null, emptyList(), 10)
+        assertTrue(radio.ids().containsAll(listOf("al5-1", "al6-1")))
+        assertEquals(4, radio.songs.size, radio.ids().toString())
+        assertEquals(setOf("Midnight Quartet", "Brush Trio"), radio.artists().toSet())
+        assertTrue(radio.more)
+    }
+
+    @Test
     fun navidromeDownIsAnError() {
         val down = Mixes(LibraryReader("http://127.0.0.1:9"), history, null, null, dir, clock = { now })
         assertTrue(runCatching { down.radio("alice", login, Mixes.SONG, "al1-2", null, null, emptyList(), 10) }.exceptionOrNull() is LibraryException)

@@ -150,8 +150,10 @@ class Mixes(
         }
         val counted = (first + second + tail).groupingBy { it.artistKey }.eachCount()
         val seeds = (first + second + tail.reversed()).distinctBy { it.artistKey }.sortedByDescending { counted[it.artistKey] }.take(4)
+        // No part of its own for the artists of the picks and likes: the ones like each other are related ones too.
         val related = related(
             login, seeds.mapNotNull { s -> s.artistId?.let { LibraryReader.ArtistRef(it, s.artist) } }, seeds.map { Played.mainArtist(it.artist) }, index, random, deadline,
+            ownLast = true,
         )
         // The first batch of a picks radio starts with the picks.
         val lead = if (hasPicks && picks.none { it.id in queued }) 8 else 0
@@ -167,11 +169,13 @@ class Mixes(
 
     /**
      * Songs of library artists like [artists] (Navidrome's similar artists) and [names] (Deezer's related ones that the
-     * library has), the ones more of them point to first, each artist's songs taking turns.
+     * library has), the ones more of them point to first, each artist's songs taking turns. [artists] and [names] are
+     * left out (their songs are a part of their own), unless [ownLast]: then the ones another of them points to come
+     * after all the others, so likes that are all like each other still go on with their artists' other songs.
      */
     private fun related(
         login: Map<String, String>, artists: List<LibraryReader.ArtistRef>, names: List<String>,
-        index: Map<String, LibraryReader.ArtistRef>, random: Random, deadline: Long,
+        index: Map<String, LibraryReader.ArtistRef>, random: Random, deadline: Long, ownLast: Boolean = false,
     ): List<LibrarySong> {
         val fromNavidrome = artists.map { a -> start { library.similarArtists(login, a.id) } }
         val fromDeezer = discovery?.let { d -> names.map { n -> start { d.relatedArtists(n).mapNotNull { index[Recommendations.loose(it)] } } } }.orEmpty()
@@ -180,10 +184,10 @@ class Mixes(
         for (future in fromNavidrome + fromDeezer) {
             future.await(deadline).orEmpty().forEachIndexed { i, ref ->
                 val key = Recommendations.loose(ref.name)
-                if (key !in own) score[key] = ref to (score[key]?.second ?: 0.0) + 1.0 - i / 40.0
+                if (ownLast || key !in own) score[key] = ref to (score[key]?.second ?: 0.0) + 1.0 - i / 40.0
             }
         }
-        val chosen = score.values.sortedByDescending { it.second }.take(RELATED).map { it.first }
+        val chosen = score.entries.sortedByDescending { it.value.second }.sortedBy { it.key in own }.take(RELATED).map { it.value.first }
         val songs = chosen.map { a -> start { library.songsOf(login, a.id, 2, random).shuffled(random) } }
         return SongPicker.interleave(songs.map { it.await(deadline).orEmpty() })
     }
