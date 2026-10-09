@@ -1,5 +1,7 @@
 package io.github.deadeyebarb.tonearm.server
 
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -10,8 +12,10 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.io.InputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -40,17 +44,7 @@ class Upstream(
     private val base = baseUrl.trimEnd('/')
 
     fun send(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body): ProxyAnswer {
-        val query = (keptQuery(call.rawQuery) + extraQuery.map { (k, v) -> k + "=" + java.net.URLEncoder.encode(v, Charsets.UTF_8) })
-            .joinToString("&")
-        val request = HttpRequest.newBuilder(URI.create("$base/${call.path}" + if (query.isEmpty()) "" else "?$query"))
-            .timeout(Duration.ofSeconds(90))
-            .method(call.method, if (body.isEmpty()) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofByteArray(body))
-            .apply {
-                keyHeader?.let { header(it, key) }
-                header("Accept", "application/json, image/*;q=0.9, */*;q=0.5")
-                if (body.isNotEmpty()) header("Content-Type", call.contentType ?: "application/json")
-            }
-            .build()
+        val request = request(call, extraQuery, body)
         return try {
             val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())
             ProxyAnswer(
@@ -71,6 +65,28 @@ class Upstream(
     /** A GET's status and body (502 when it couldn't be asked). */
     fun get(path: String, query: String? = null): Pair<Int, String> =
         send(ProxyCall("GET", path, query, null, ByteArray(0))).let { it.status to it.body.decodeToString() }
+
+    /** A GET's answer, read by [parse] as it comes in so a long one is never held whole; null unless it was a 200 that could be read. */
+    fun <T> read(path: String, query: String? = null, parse: (InputStream) -> T): T? = try {
+        val response = http.send(request(ProxyCall("GET", path, query, null, ByteArray(0))), HttpResponse.BodyHandlers.ofInputStream())
+        response.body().use { if (response.statusCode() == 200) parse(it) else null }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun request(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body): HttpRequest {
+        val query = (keptQuery(call.rawQuery) + extraQuery.map { (k, v) -> k + "=" + java.net.URLEncoder.encode(v, Charsets.UTF_8) })
+            .joinToString("&")
+        return HttpRequest.newBuilder(URI.create("$base/${call.path}" + if (query.isEmpty()) "" else "?$query"))
+            .timeout(Duration.ofSeconds(90))
+            .method(call.method, if (body.isEmpty()) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofByteArray(body))
+            .apply {
+                keyHeader?.let { header(it, key) }
+                header("Accept", "application/json, image/*;q=0.9, */*;q=0.5")
+                if (body.isNotEmpty()) header("Content-Type", call.contentType ?: "application/json")
+            }
+            .build()
+    }
 
     private fun keptQuery(raw: String?): List<String> = raw.orEmpty().split('&').filter { part ->
         part.isNotEmpty() && java.net.URLDecoder.decode(part.substringBefore('='), Charsets.UTF_8).lowercase() !in DROPPED
@@ -294,19 +310,36 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
     private fun realArtist(foreignAlbumId: String, claimed: String?): JsonObject? {
         val (status, known) = lidarr.get("api/v1/album", "foreignAlbumId=" + java.net.URLEncoder.encode(foreignAlbumId, Charsets.UTF_8))
         if (status != 200) return null
-        val inLidarr = runCatching { json.parseToJsonElement(known).jsonArray.firstOrNull() as? JsonObject }.getOrNull()
+        val inLidarr = parsed { json.parseToJsonElement(known).jsonArray.firstOrNull() as? JsonObject }
         inLidarr?.string("artistId")?.let { id -> return owners(listOf("artist/$id"))?.firstOrNull() }
-        val mbid = if (runCatching { java.util.UUID.fromString(foreignAlbumId) }.isSuccess) {
+        val mbid = if (UUID.matches(foreignAlbumId)) {
             val (found, body) = lidarr.get("api/v1/album/lookup", "term=" + java.net.URLEncoder.encode("lidarr:$foreignAlbumId", Charsets.UTF_8))
             if (found != 200) return null
-            val album = runCatching { json.parseToJsonElement(body).jsonArray.firstOrNull() as? JsonObject }.getOrNull() ?: return null
+            val album = parsed { json.parseToJsonElement(body).jsonArray.firstOrNull() as? JsonObject } ?: return null
             val artist = album["artist"] as? JsonObject ?: return null
             if (artist.string("path") != null) return artist
             artist.string("foreignArtistId") ?: return null
         } else claimed ?: return JsonObject(emptyMap())
-        // Lidarr's artist list says for sure whether it has them, and where.
-        val all = lidarr.getJson("api/v1/artist")?.let { runCatching { json.parseToJsonElement(it).jsonArray.mapNotNull { a -> a as? JsonObject } }.getOrNull() } ?: return null
-        return all.firstOrNull { it.string("foreignArtistId") == mbid } ?: JsonObject(emptyMap())
+        // Lidarr says for sure whether it has them, and where: asked by MusicBrainz id (old ids of the artist count too), or
+        // else by going through its list of artists as it comes in, which is long and never read whole.
+        val byId = UUID.matches(mbid)
+        val homes = lidarr.read("api/v1/artist", if (byId) "mbId=$mbid" else null) { json.decodeFromStream(ARTIST_HOMES, it) } ?: return null
+        val home = homes.firstOrNull { it.foreignArtistId == mbid } ?: homes.singleOrNull()?.takeIf { byId } ?: return JsonObject(emptyMap())
+        return buildJsonObject {
+            home.artistName?.let { put("artistName", it) }
+            home.path?.let { put("path", it) }
+        }
+    }
+
+    /** The little of a Lidarr artist that says who it is and where its music goes. */
+    @Serializable
+    private class ArtistHome(val foreignArtistId: String? = null, val artistName: String? = null, val path: String? = null)
+
+    /** What [parse] makes of an answer, or null when it isn't what was expected (running out of memory isn't that). */
+    private fun <T> parsed(parse: () -> T): T? = try {
+        parse()
+    } catch (e: IllegalArgumentException) {
+        null
     }
 
     /**
@@ -395,7 +428,7 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
         }
     }
 
-    private fun jsonObject(body: ByteArray) = runCatching { json.parseToJsonElement(body.decodeToString()).jsonObject }.getOrNull()
+    private fun jsonObject(body: ByteArray) = parsed { json.parseToJsonElement(body.decodeToString()).jsonObject }
 
     /** Whether [path] is inside [folder]; never for paths with "." or ".." in them, which needn't stay where they say. */
     private fun isUnder(path: String, folder: String): Boolean {
@@ -430,6 +463,9 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
             val hash = java.security.MessageDigest.getInstance("SHA-256").digest(user.encodeToByteArray()).take(4).joinToString("") { "%02x".format(it) }
             return "$safe-$hash"
         }
+
+        private val UUID = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        private val ARTIST_HOMES = ListSerializer(ArtistHome.serializer())
 
         /** What a user's artist request may not set itself: where it goes and its tags. */
         private val ARTIST_KEYS_SET_HERE = setOf("path", "folder", "rootfolderpath", "tags")

@@ -137,4 +137,18 @@ class DiscoveryTest {
         assertEquals("Portishead", name)
         assertEquals(listOf("Massive Attack" to true, "Tricky" to false, "Björk" to false, "Air" to false), similar.map { it.artist to it.inLibrary })
     }
+
+    @Test
+    fun deezersAnswersAreKeptAsFarAsThereIsRoom() {
+        val url = "http://127.0.0.1:${fake.address.port}"
+        val small = Discovery(url, Files.createTempDirectory("tonearm-discovery").toFile(), deezer = "$url/deezer", cacheChars = 1_000)
+        small.search("portishead")
+        val calls = deezerCalls
+        assertEquals("Portishead", small.search("portishead").artists.single().artist)
+        assertEquals(calls, deezerCalls)
+        // More searches don't fit with it: the answers used longest ago went, and are asked for again.
+        listOf("a", "b", "c", "d", "e", "f").forEach { small.search(it) }
+        assertEquals("Glory Box", small.search("portishead").songs.single().title)
+        assertEquals(calls + 21, deezerCalls)
+    }
 }

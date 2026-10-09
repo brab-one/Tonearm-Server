@@ -90,6 +90,7 @@ class PicksFolderTest {
                     path == "/api/v1/album/lookup" -> 200 to when (ex.requestURI.query) {
                         "term=lidarr%3A$SOUVLAKI", "term=lidarr:$SOUVLAKI" -> """[{"title":"Souvlaki","artist":{"artistName":"Slowdive","foreignArtistId":"mb-slowdive","path":"/picks/carol/Slowdive"}}]"""
                         "term=lidarr%3A$KID_A", "term=lidarr:$KID_A" -> """[{"title":"Kid A","artist":{"artistName":"Radiohead","foreignArtistId":"mb-radiohead"}}]"""
+                        "term=lidarr%3A$MEZZANINE", "term=lidarr:$MEZZANINE" -> """[{"title":"Mezzanine","artist":{"artistName":"Massive Attack","foreignArtistId":"$MASSIVE_ATTACK"}}]"""
                         else -> "[]"
                     }
                     path == "/api/v1/artist/10" -> 200 to """{"id":10,"artistName":"Low","path":"/picks/bob/Low","rootFolderPath":"/picks/bob"}"""
@@ -99,8 +100,12 @@ class PicksFolderTest {
                     path == "/api/v1/artist/13" -> 200 to """{"id":13,"path":"/picks/bob/../../music/Radiohead/OK Computer"}"""
                     // Lidarr set to put artists in a folder by first letter.
                     path == "/api/v1/artist/14" -> 200 to """{"id":14,"path":"/picks/bob/L/Low","rootFolderPath":"/picks/bob"}"""
-                    path == "/api/v1/artist" -> 200 to """[{"id":10,"artistName":"Low","foreignArtistId":"mb-low","path":"/picks/bob/Low"},
-                        {"id":11,"artistName":"Slowdive","foreignArtistId":"mb-slowdive","path":"/picks/carol/Slowdive"},
+                    // Asked by MusicBrainz id, Lidarr answers with that artist alone.
+                    path == "/api/v1/artist" && ex.requestURI.query == "mbId=$MASSIVE_ATTACK" ->
+                        200 to """[{"id":15,"artistName":"Massive Attack","foreignArtistId":"$MASSIVE_ATTACK","path":"/picks/carol/Massive Attack","overview":"Bristol."}]"""
+                    path == "/api/v1/artist" && ex.requestURI.query.orEmpty().startsWith("mbId=") -> 200 to "[]"
+                    path == "/api/v1/artist" -> 200 to """[{"id":10,"artistName":"Low","foreignArtistId":"mb-low","path":"/picks/bob/Low","statistics":{"albumCount":1}},
+                        {"id":11,"artistName":"Slowdive","foreignArtistId":"mb-slowdive","path":"/picks/carol/Slowdive","images":[{"url":"x"}]},
                         {"id":12,"artistName":"Radiohead","foreignArtistId":"mb-radiohead","path":"/music/Radiohead"}]"""
                     else -> 200 to """{"ok":true}"""
                 }
@@ -210,6 +215,8 @@ class PicksFolderTest {
         /** MusicBrainz ids, which Lidarr's metadata looks up. */
         const val SOUVLAKI = "6d4f9a0e-2a3b-4c5d-8e9f-0a1b2c3d4e5f"
         const val KID_A = "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e"
+        const val MEZZANINE = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+        const val MASSIVE_ATTACK = "10adbe5e-a2c0-4bf3-8249-2b4cbf6e6ca8"
     }
 
     @Test
@@ -247,6 +254,14 @@ class PicksFolderTest {
         assertEquals(502, command("""{"name":"AlbumSearch","albumIds":[25]}"""))
         assertEquals(200, command("""{"name":"AlbumSearch","albumIds":[22],"extra":{"x":1}}"""))
         assertEquals("""{"name":"AlbumSearch","albumIds":[22]}""", sent["POST /api/v1/command"])
+    }
+
+    @Test
+    fun anArtistWithAMusicBrainzIdIsLookedUpAloneNotInLidarrsWholeList() {
+        val (code, text) = call("/connect-tonearm/lidarr/api/v1/album", bob, body = """{"title":"x","foreignAlbumId":"$MEZZANINE","artist":{"foreignArtistId":"mb-radiohead","rootFolderPath":"/music"}}""")
+        assertEquals(409, code)
+        assertTrue("Massive Attack" in text)
+        assertEquals("mbId=$MASSIVE_ATTACK", sent["GET /api/v1/artist"])
     }
 
     @Test

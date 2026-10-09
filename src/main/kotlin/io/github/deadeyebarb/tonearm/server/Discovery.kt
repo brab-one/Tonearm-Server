@@ -3,6 +3,7 @@ package io.github.deadeyebarb.tonearm.server
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -64,11 +65,19 @@ class Discovery(
     private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
     /** What the apps played, skipped and said no to, for seeds that follow the listening. */
     private val history: History? = null,
+    /** How much of Deezer's answers is kept, in characters of JSON. */
+    private val cacheChars: Long = CACHE_CHARS,
 ) {
     private val dir = File(dataDir, "discovery").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-    /** Deezer answers by URL, for a week: artists' relations and albums barely change. */
-    private val cache = ConcurrentHashMap<String, Pair<JsonObject, Long>>()
+    /**
+     * Deezer answers by URL, only what's read of them: searches for an hour, artists' relations and albums (which barely
+     * change) for a week. Past [cacheChars], the ones used longest ago go.
+     */
+    private val cache = LinkedHashMap<String, Cached>(64, 0.75f, true)
+    private var cachedChars = 0L
+
+    private class Cached(val body: JsonObject, val at: Long, val chars: Int)
     private val pool = Executors.newFixedThreadPool(4) { Thread(it, "discovery").apply { isDaemon = true } }
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "discovery-picks").apply { isDaemon = true } }
     private val running = ConcurrentHashMap.newKeySet<String>()
@@ -104,7 +113,7 @@ class Discovery(
         }
     }
 
-    /** Songs, albums and artists matching [query] on Deezer (answers kept for a week like the rest). */
+    /** Songs, albums and artists matching [query] on Deezer (answers kept for an hour). */
     fun search(query: String): WebSearch {
         val q = URLEncoder.encode(query, Charsets.UTF_8)
         val songs = pool.submit<List<WebSong>> {
@@ -230,14 +239,28 @@ class Discovery(
 
     private fun get(path: String): JsonObject {
         val now = System.currentTimeMillis()
-        cache[path]?.takeIf { now - it.second < CACHE_MS }?.let { return it.first }
+        val keep = if (path.startsWith("/search")) SEARCH_CACHE_MS else CACHE_MS
+        synchronized(cache) { cache[path]?.takeIf { now - it.at < keep }?.let { return it.body } }
         val request = HttpRequest.newBuilder(URI.create(deezer.trimEnd('/') + path)).timeout(Duration.ofSeconds(15)).GET().build()
         val body = json.parseToJsonElement(http.send(request, HttpResponse.BodyHandlers.ofString()).body()).jsonObject
         body["error"]?.let { throw IllegalStateException("Deezer: " + ((it as? JsonObject)?.str("message") ?: it.toString())) }
-        if (cache.size > 20_000) cache.clear()
-        cache[path] = body to now
-        return body
+        val kept = JsonObject(mapOf("data" to JsonArray(body["data"]?.jsonArray.orEmpty().map(::slim))))
+        val chars = kept.toString().length
+        synchronized(cache) {
+            cache.put(path, Cached(kept, now, chars))?.let { cachedChars -= it.chars }
+            cachedChars += chars
+            val oldest = cache.values.iterator()
+            while (cachedChars > cacheChars && oldest.hasNext()) {
+                cachedChars -= oldest.next().chars
+                oldest.remove()
+            }
+        }
+        return kept
     }
+
+    /** What's read of a Deezer entry (names, pictures, fans, kind, date, its artist and album); the rest isn't kept. */
+    private fun slim(element: JsonElement): JsonElement =
+        (element as? JsonObject)?.let { o -> JsonObject(o.filterKeys { it in READ }.mapValues { (_, v) -> slim(v) }) } ?: element
 
     private fun subsonic(method: String, params: Map<String, String>): JsonObject {
         val url = navidromeUrl.trimEnd('/') + "/rest/$method.view?" + (params + mapOf("v" to "1.16.1", "c" to "tonearm-server", "f" to "json"))
@@ -277,6 +300,10 @@ class Discovery(
         private const val DAY_MS = 24 * 3_600_000L
         private const val MAX_AGE_MS = 24 * 3_600_000L
         private const val CACHE_MS = 7 * 24 * 3_600_000L
+        private const val SEARCH_CACHE_MS = 3_600_000L
+        /** About 12 MB of memory. */
+        private const val CACHE_CHARS = 2_000_000L
+        private val READ = setOf("id", "name", "title", "picture_medium", "cover_medium", "nb_fan", "fans", "record_type", "release_date", "duration", "artist", "album")
         private const val LIBRARY_MS = 10 * 60_000L
         private const val SEEDS = 15
         private const val PICKS = 16
