@@ -42,6 +42,12 @@ data class AiPicks(
     val model: String = "",
     /** What the picks were asked to be like ("the album OK Computer by Radiohead"), if anything. */
     val seed: String? = null,
+    /**
+     * The latest picks made from their listening as a whole (no [seed]), which weekly picks download: a "more like
+     * this" doesn't take their place here. Its [running] is for a run of those, going or waiting. Stored as null
+     * while the picks above are them.
+     */
+    val weekly: AiPicks? = null,
 )
 
 /** A suggested album as Lidarr knows it: the real one with its year, and what kind it is ("Album", "EP", "Live"…). */
@@ -147,10 +153,15 @@ class Recommendations(
     private val dir = File(dataDir, "recommendations").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val running = ConcurrentHashMap.newKeySet<String>()
-    /** Hands [running] over from a run that ends to the "more like this" waiting for it. */
+    /** Hands [running] over from a run that ends to the ask waiting for it; guards [runningSeed] and [pending] too. */
     private val lock = Any()
-    /** A "more like this" asked for while a run was going, with the listening read then: started when that run ends (the latest ask wins). */
-    private val pending = HashMap<String, Pair<Taste, String>>()
+    /** What the run going for a user was asked to be like (null: their listening as a whole). */
+    private val runningSeed = HashMap<String, String?>()
+    /**
+     * Asks that came in while a run was going, with the listening read then, oldest first: started one after the other
+     * when it ends. At most a refresh and a "more like this" (the latest), so neither takes the other's place.
+     */
+    private val pending = HashMap<String, List<Pair<Taste, String?>>>()
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "recommendations").apply { isDaemon = true } }
     private val searchWorker = Executors.newSingleThreadExecutor { Thread(it, "ai-search").apply { isDaemon = true } }
     /** AI searches by query, for a day: the same search from anyone gets the same answer. */
@@ -158,30 +169,64 @@ class Recommendations(
 
     /**
      * The user's picks; starts new ones when asked to, or when there are none or they're a week old. A
-     * [seed] asks for albums like that in particular ("more like this").
+     * [seed] asks for albums like that in particular ("more like this"). Asked for while another run is going,
+     * they're made after it.
      */
     fun get(user: String, login: Map<String, String>, refresh: Boolean, seed: String? = null): AiPicks {
         val stored = load(user)
         val due = refresh || seed != null || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt > MAX_AGE_MS
-        // The listening is read now, while the login is at hand; with a run going, only a "more like this" needs it, for later.
-        if (due && (seed != null || user !in running)) {
+        // A refresh or a "more like this" waits for the run going (unless it's the same); picks that are only old don't then.
+        val asked = refresh || seed != null
+        // The listening is read now, while the login is at hand.
+        if (due && synchronized(lock) { if (asked) !going(user, seed) else user !in running }) {
             val taste = try {
                 taste(user, login)
             } catch (e: Exception) {
-                return stored.copy(problem = "Couldn't read your listening from Navidrome: ${e.message}")
+                return shown(user, "Couldn't read your listening from Navidrome: ${e.message}", seed)
             }
             val idle = synchronized(lock) {
-                if (running.add(user)) true else {
-                    if (seed != null) pending[user] = taste to seed
-                    false
+                when {
+                    running.add(user) -> true.also { runningSeed[user] = seed }
+                    asked && !going(user, seed) -> false.also {
+                        pending[user] = pending[user].orEmpty().filter { (it.second == null) != (seed == null) } + (taste to seed)
+                    }
+                    else -> false
                 }
             }
             if (idle) start(user, taste, seed)
         }
-        return load(user).let { it.copy(picks = it.picks.filter { p -> history?.isDismissed(user, p.artist, p.album) != true }, running = user in running, model = model) }
+        return shown(user)
     }
 
-    /** Makes [user]'s picks in the background, then the "more like this" that came in meanwhile, if one did. */
+    /** Whether a run for [seed] (null: their listening as a whole) is going or waiting for [user] already. Under [lock]. */
+    private fun going(user: String, seed: String?) =
+        user in running && runningSeed[user] == seed || pending[user].orEmpty().any { it.second == seed }
+
+    /** The user's picks as the apps get them, the weekly ones with them; [problem] is this ask's, for [seed]. */
+    private fun shown(user: String, problem: String? = null, seed: String? = null): AiPicks {
+        val stored = load(user)
+        val weekly = weeklyOf(stored)
+        val (busy, weeklyBusy) = synchronized(lock) {
+            (user in running) to (user in running && runningSeed[user] == null || pending[user].orEmpty().any { it.second == null })
+        }
+        fun forApps(picks: AiPicks) = picks.copy(picks = picks.picks.filter { p -> history?.isDismissed(user, p.artist, p.album) != true }, model = model)
+        return forApps(stored).copy(
+            running = busy, problem = problem ?: stored.problem,
+            weekly = forApps(weekly).copy(running = weeklyBusy, problem = problem?.takeIf { seed == null } ?: weekly.problem, weekly = null),
+        )
+    }
+
+    /** The weekly picks in what's stored: kept apart once a "more like this" took their place (none from before that was so). */
+    private fun weeklyOf(stored: AiPicks): AiPicks = stored.weekly ?: if (stored.seed == null) stored else AiPicks()
+
+    /** What's stored, with [problem] from a failed run for [seed]: on the weekly picks too when the run was for those. */
+    private fun withProblem(user: String, seed: String?, problem: String): AiPicks {
+        val stored = load(user)
+        val weekly = weeklyOf(stored)
+        return stored.copy(problem = problem, weekly = if (seed == null) weekly.copy(problem = problem) else weekly)
+    }
+
+    /** Makes [user]'s picks in the background, then what was asked for meanwhile, if anything was. */
     private fun start(user: String, taste: Taste, seed: String?) {
         worker.execute {
             val stored = load(user)
@@ -190,12 +235,13 @@ class Recommendations(
                 val outcome = run(taste, stored.picks, seed)
                 val picks = outcome.picks.filter { history?.isDismissed(user, it.artist, it.album) != true }
                 val madeAt = System.currentTimeMillis()
-                // An answer with nothing usable keeps the picks there are.
-                save(user, if (picks.isEmpty()) load(user).copy(problem = "The AI had nothing usable this time") else AiPicks(picks, madeAt, model = model, seed = seed))
+                // An answer with nothing usable keeps the picks there are. A "more like this" keeps the weekly ones beside it.
+                save(user, if (picks.isEmpty()) withProblem(user, seed, "The AI had nothing usable this time")
+                    else AiPicks(picks, madeAt, model = model, seed = seed, weekly = if (seed == null) null else weeklyOf(load(user))))
                 log(user, outcome.copy(picks = picks), madeAt, seed, stored)
             } catch (e: Exception) {
                 val problem = "${ai.name}: ${e.message ?: e.javaClass.simpleName}"
-                save(user, load(user).copy(problem = problem))
+                save(user, withProblem(user, seed, problem))
                 // What the model was asked and how far it got: that's what tells why it failed.
                 val failed = e as? RunFailed
                 failed?.let { runCatching { DataFiles.write(File(dir, name(user) + ".prompt.txt"), it.prompt) } }
@@ -205,8 +251,17 @@ class Recommendations(
                     thinkingChars = answer?.thinkingChars, stop = answer?.stop, seconds = (System.currentTimeMillis() - started) / 1000, problem = problem,
                 ))
             } finally {
-                // A waiting "more like this" keeps the user running and goes next.
-                val next = synchronized(lock) { pending.remove(user).also { if (it == null) running.remove(user) } }
+                // What was asked for meanwhile keeps the user running and goes next, the oldest first.
+                val next = synchronized(lock) {
+                    val waiting = pending.remove(user).orEmpty()
+                    if (waiting.size > 1) pending[user] = waiting.drop(1)
+                    waiting.firstOrNull().also {
+                        if (it == null) {
+                            running.remove(user)
+                            runningSeed.remove(user)
+                        } else runningSeed[user] = it.second
+                    }
+                }
                 next?.let { (nextTaste, nextSeed) -> start(user, nextTaste, nextSeed) }
             }
         }

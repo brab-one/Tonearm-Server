@@ -553,6 +553,107 @@ class RecommendationsTest {
         assertTrue("more like $seed" in ai.prompts.last())
     }
 
+    /** An AI that waits for [weekly] on picks from the listening as a whole and for [moreLike] on a "more like this". */
+    private inner class GatedAi {
+        val weekly = java.util.concurrent.CountDownLatch(1)
+        val moreLike = java.util.concurrent.CountDownLatch(1)
+        val ai = FakeAi { prompt ->
+            val seeded = "more like" in prompt
+            (if (seeded) moreLike else weekly).await(10, java.util.concurrent.TimeUnit.SECONDS)
+            val (artist, album) = if (seeded) "Tricky" to "Maxinquaye" else "Mazzy Star" to "So Tonight That I Might See"
+            """{"recommendations":[{"artist":"$artist","album":"$album","year":1995,"songs":[],"why":"Fits."}]}"""
+        }
+        val engine = Recommendations(ai, "http://127.0.0.1:${fake.address.port}", Files.createTempDirectory("tonearm-recs").toFile())
+
+        fun until(done: (AiPicks) -> Boolean): AiPicks {
+            var picks = engine.get("alice", login, refresh = false)
+            repeat(100) { if (!done(picks)) { Thread.sleep(50); picks = engine.get("alice", login, refresh = false) } }
+            return picks
+        }
+    }
+
+    @Test
+    fun aMoreLikeThisDoesntTakeTheWeeklyPicksPlace() {
+        val gated = GatedAi()
+        val asked = gated.engine.get("alice", login, refresh = true)
+        assertTrue(asked.weekly!!.running)
+        val seed = "the album “Dummy” by Portishead"
+        gated.engine.get("alice", login, refresh = true, seed = seed)
+        gated.weekly.countDown()
+        // The weekly run is done while the "more like this" is still going: weekly picks see theirs now.
+        val between = gated.until { !it.weekly!!.running }
+        assertTrue(between.running)
+        assertEquals(listOf("Mazzy Star"), between.weekly!!.picks.map { it.artist })
+        assertTrue(between.weekly!!.madeAt > asked.weekly!!.madeAt)
+        gated.moreLike.countDown()
+        val done = gated.until { !it.running }
+        assertEquals(seed, done.seed)
+        assertEquals(listOf("Tricky"), done.picks.map { it.artist })
+        assertEquals(between.weekly, done.weekly)
+    }
+
+    @Test
+    fun aRefreshDuringAMoreLikeThisIsMadeAfterIt() {
+        val gated = GatedAi()
+        val seed = "the album “Dummy” by Portishead"
+        assertFalse(gated.engine.get("alice", login, refresh = true, seed = seed).weekly!!.running)
+        // Weekly picks asking now wait for a run of their own instead of taking the "more like this" for it.
+        assertTrue(gated.engine.get("alice", login, refresh = true).weekly!!.running)
+        gated.moreLike.countDown()
+        gated.weekly.countDown()
+        val done = gated.until { !it.running }
+        assertEquals(2, gated.ai.prompts.size)
+        assertEquals(null, done.seed)
+        assertEquals(listOf("Mazzy Star"), done.weekly!!.picks.map { it.artist })
+        assertFalse(done.weekly!!.running)
+    }
+
+    @Test
+    fun theSameMoreLikeThisTwiceIsOneRun() {
+        val dummy = "the album “Dummy” by Portishead"
+        val mezzanine = "the album “Mezzanine” by Massive Attack"
+        val twice = GatedAi()
+        twice.engine.get("alice", login, refresh = true, seed = dummy)
+        // Tapped twice, or asked on the phone and the desktop: the run going is the one.
+        assertTrue(twice.engine.get("alice", login, refresh = true, seed = dummy).running)
+        twice.moreLike.countDown()
+        assertEquals(dummy, twice.until { !it.running }.seed)
+        assertEquals(1, twice.ai.prompts.size)
+        // Another album waits, once, however often it's asked.
+        val another = GatedAi()
+        another.engine.get("alice", login, refresh = true, seed = dummy)
+        repeat(2) { another.engine.get("alice", login, refresh = true, seed = mezzanine) }
+        another.moreLike.countDown()
+        assertEquals(mezzanine, another.until { !it.running }.seed)
+        assertEquals(2, another.ai.prompts.size)
+        assertTrue("more like $dummy" in another.ai.prompts.first())
+    }
+
+    @Test
+    fun aFailedMoreLikeThisLeavesTheWeeklyPicksAlone() {
+        var down = false
+        val ai = FakeAi { prompt ->
+            if (down) throw java.net.ConnectException("Connection refused")
+            val (artist, album) = if ("more like" in prompt) "Tricky" to "Maxinquaye" else "Mazzy Star" to "So Tonight That I Might See"
+            """{"recommendations":[{"artist":"$artist","album":"$album","year":1995,"songs":[],"why":"Fits."}]}"""
+        }
+        val engine = Recommendations(ai, "http://127.0.0.1:${fake.address.port}", Files.createTempDirectory("tonearm-recs").toFile())
+        fun until(start: AiPicks): AiPicks {
+            var picks = start
+            repeat(100) { if (picks.running) { Thread.sleep(50); picks = engine.get("alice", login, refresh = false) } }
+            return picks
+        }
+        val weekly = until(engine.get("alice", login, refresh = true)).weekly!!
+        down = true
+        val failed = until(engine.get("alice", login, refresh = true, seed = "the album “Dummy” by Portishead"))
+        assertTrue(failed.problem!!.startsWith("Ollama: "), failed.problem)
+        assertEquals(weekly, failed.weekly)
+        // A weekly run failing says so on the weekly picks.
+        val weeklyFailed = until(engine.get("alice", login, refresh = true)).weekly!!
+        assertEquals(weekly.picks, weeklyFailed.picks)
+        assertTrue(weeklyFailed.problem!!.startsWith("Ollama: "), weeklyFailed.problem)
+    }
+
     @Test
     fun skipsCountForTheirOwnArtistInAnyScript() {
         val history = History(Files.createTempDirectory("tonearm-history").toFile())
