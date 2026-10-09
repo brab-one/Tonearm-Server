@@ -38,6 +38,8 @@ class TonearmServer(
     private val malojaImport: ((user: String, admin: Boolean) -> Unit)? = null,
     /** Proxies whose word on who they forwarded a request for is taken (X-Forwarded-For, X-Real-IP). */
     private val trustedProxies: List<AddressRange> = AddressRange.LOCAL,
+    /** Where each device left off, for Continue from the desktop. */
+    private val handoffs: Handoffs = Handoffs(dataDir),
 ) {
     private val base = "/" + basePath.trim('/')
     private val json = Json { ignoreUnknownKeys = true }
@@ -119,6 +121,7 @@ class TonearmServer(
                 put("history", true)
                 put("dislikes", true)
                 put("stats", true)
+                put("resume", true)
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
@@ -138,7 +141,9 @@ class TonearmServer(
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")
-                buildJsonObject { put("ok", true); put("seq", users.publish(device, payload)) }
+                val seq = users.publish(device, payload)
+                handoffs.record(user, device, payload)
+                buildJsonObject { put("ok", true); put("seq", seq) }
             }
             "devices" -> buildJsonObject {
                 put("devices", JsonArray(users.list().map { d ->
@@ -167,9 +172,13 @@ class TonearmServer(
                 }
             }
             "forget" -> {
-                if (!device.isNullOrEmpty()) users.forget(device)
+                if (!device.isNullOrEmpty()) {
+                    users.forget(device)
+                    handoffs.gone(user, device)
+                }
                 buildJsonObject { put("ok", true) }
             }
+            "resume" -> handoffs.toJson(handoffs.latest(user, device?.ifEmpty { null }) { users.isOnline(it) })
             "get" -> {
                 val key = query["key"]
                 if (!Store.validKey(key)) return error(exchange, 400, "a valid key is required")

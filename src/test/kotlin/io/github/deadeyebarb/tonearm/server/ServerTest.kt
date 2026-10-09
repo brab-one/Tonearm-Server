@@ -451,6 +451,26 @@ class ServerTest {
     }
 
     @Test
+    fun theDesktopsLastSongOutlivesItsGoodbye() {
+        val state = """{"id":"desk-1","name":"Tonearm on desk","kind":"desktop","playback":{"playing":true,"positionMs":20000,"index":1,"queue":[{"id":"s1"},{"id":"s2"}]}}"""
+        api("publish", alice(), listOf("device" to "desk-1"), state)
+        val online = api("resume", alice(), listOf("device" to "phone-x"))["handoff"]!!.jsonObject
+        assertEquals("true", online["online"]!!.jsonPrimitive.content)
+        assertEquals("true", online["playing"]!!.jsonPrimitive.content)
+        api("forget", alice(), listOf("device" to "desk-1"))
+        val handoff = api("resume", alice(), listOf("device" to "phone-x"))["handoff"]!!.jsonObject
+        assertEquals("desk-1", handoff["device"]!!.jsonPrimitive.content)
+        assertEquals("Tonearm on desk", handoff["name"]!!.jsonPrimitive.content)
+        assertEquals("false", handoff["online"]!!.jsonPrimitive.content)
+        assertEquals("false", handoff["playing"]!!.jsonPrimitive.content)
+        assertEquals(state, handoff["state"]!!.jsonPrimitive.content)
+        assertTrue(handoff["playedAt"]!!.jsonPrimitive.long > 0)
+        // Not for the desktop itself, and nobody else sees it.
+        assertTrue(api("resume", alice(), listOf("device" to "desk-1"))["handoff"] is kotlinx.serialization.json.JsonNull)
+        assertTrue(api("resume", bob, listOf("device" to "phone-x"))["handoff"] is kotlinx.serialization.json.JsonNull)
+    }
+
+    @Test
     fun navidromeBeingDownIsABadGateway() {
         navidrome.stop(0)
         assertEquals(502, call("/connect-tonearm/api/hello", alice()).first)

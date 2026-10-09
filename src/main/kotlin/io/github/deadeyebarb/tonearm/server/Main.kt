@@ -40,6 +40,9 @@ fun main() {
     // Ollama downloads the model now if it hasn't got it, rather than at the first question.
     ai?.prepare()
     val history = History(dataDir)
+    // Where each device left off, written on the way out too (the image's entrypoint execs the server, so SIGTERM gets here).
+    val handoffs = Handoffs(dataDir)
+    Runtime.getRuntime().addShutdownHook(Thread({ handoffs.flush() }, "handoffs"))
     val recommendations = ai?.let { Recommendations(it, navidrome, dataDir, lidarr?.let { proxy -> AlbumCheck(proxy::findAlbum) }, history) }
     val discovery = if (env("DISCOVERY")?.lowercase() == "off") null else Discovery(navidrome, dataDir, history = history)
     val malojaImport = env("MALOJA_URL")?.let { url -> malojaImport(url, env("MALOJA_API_KEY"), env("MALOJA_USERS"), history) }
@@ -54,7 +57,7 @@ fun main() {
             exitProcess(2)
         }
     }
-    TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, recommendations, discovery, history, malojaImport, trusted).start()
+    TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, recommendations, discovery, history, malojaImport, trusted, handoffs = handoffs).start()
     println("Tonearm server $version on port $port under ${"/" + basePath.trim('/')}, checking logins with Navidrome at $navidrome, data in $dataDir")
     println("Proxies trusted to say who they forward for: " + (proxies ?: "127.0.0.0/8, ::1, 172.16.0.0/12 (Docker's networks)"))
     println("Lidarr: " + (env("LIDARR_URL")?.let { "$it, " + if (lidarr!!.available(false)) "requests for everyone" else "admins only" } ?: "not set up"))
