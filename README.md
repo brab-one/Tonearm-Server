@@ -33,8 +33,8 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   Picks radio starts with your newest weekly picks and goes on with what you liked this month and artists like
   them. It leaves out what's queued, disliked songs, artists and albums said no to and what you played in the last
   6 hours, with at most 2 songs per artist a batch and the artists spaced out. The car's Radio button, the phone's
-  shortcut and the desktop's Picks radio use it; the last songs queued after the one it started from steer the next
-  batch, so a long radio follows what's playing.
+  shortcut and the desktop's Picks radio use it; the last songs queued after the one it started from (the apps say
+  which one that is) steer the next batch, so a long radio follows what's playing.
 - **Mixes from a sentence**, with an AI: "rainy sunday, mellow jazz" becomes a mix of 30 songs from your
   library: the songs the AI names that the library has first, then its artists and genres. Each one is kept for
   the day (Ask again makes a new one), one at a time per user. Without an AI the apps match the words in the

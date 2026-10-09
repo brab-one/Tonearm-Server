@@ -272,6 +272,8 @@ class TonearmServer(
                 val id = param("id")
                 val artist = param("artist")
                 val title = param("title")
+                // The seed as the queue keys it, so only what was queued after it steers.
+                val key = param("key")
                 if (seed == Mixes.SONG && id == null && (artist == null || title == null)) return error(exchange, 400, "seed=song needs id, or artist and title")
                 // The queue, oldest first, as the apps key songs.
                 val exclude = if (payload.isBlank()) emptyList() else try {
@@ -281,7 +283,7 @@ class TonearmServer(
                 }
                 val count = (query["count"]?.toIntOrNull() ?: 25).coerceIn(5, 50)
                 try {
-                    engine.toJson(engine.radio(user, NavidromeAuth.loginOf(query), seed, id, artist, title, exclude.takeLast(Mixes.MAX_EXCLUDE), count))
+                    engine.toJson(engine.radio(user, NavidromeAuth.loginOf(query), seed, id, artist, title, exclude.takeLast(Mixes.MAX_EXCLUDE), count, key))
                 } catch (e: LibraryException) {
                     return error(exchange, 502, "Couldn't read your library: ${e.message}")
                 }

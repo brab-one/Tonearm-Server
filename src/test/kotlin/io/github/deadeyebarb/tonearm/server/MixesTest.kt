@@ -244,6 +244,31 @@ class MixesTest {
     }
 
     @Test
+    fun theSeedsKeyMarksWhereTheRadioStarted() {
+        val mixes = mixes()
+        fun youTube(queue: List<String>, key: String?) =
+            mixes.radio("alice", login, Mixes.SONG, null, "The Oscillators - Topic", "Middle C (Official Video)", queue, 10, key)
+        // Radio from a YouTube song played after library songs: those don't steer, but they're still left out.
+        val first = youTube(listOf("lib/al5-1", "lib/al6-1", "yt/mid"), "yt/mid")
+        assertEquals(listOf("al1-2"), asked("getSimilarSongs2"))
+        assertTrue(first.ids().none { it == "al5-1" || it == "al6-1" })
+        // What the radio queued after it does.
+        synchronized(calls) { calls.clear() }
+        youTube(listOf("lib/al5-1", "yt/mid", "lib/al4-1"), "yt/mid")
+        assertEquals(setOf("al1-2", "al4-1"), asked("getSimilarSongs2").toSet())
+        // Without a key, or one that isn't queued, the whole queue steers.
+        for (key in listOf(null, "yt/other")) {
+            synchronized(calls) { calls.clear() }
+            youTube(listOf("lib/al5-1", "lib/al6-1", "yt/mid"), key)
+            assertEquals(setOf("al1-2", "al5-1", "al6-1"), asked("getSimilarSongs2").toSet())
+        }
+        // A library song's key is its id's.
+        synchronized(calls) { calls.clear() }
+        mixes.radio("alice", login, Mixes.SONG, "al1-2", null, null, listOf("lib/al5-1", "lib/al1-2", "lib/al4-1"), 10, "lib/al1-2")
+        assertEquals(setOf("al1-2", "al4-1"), asked("getSimilarSongs2").toSet())
+    }
+
+    @Test
     fun slowAgentsStillLeaveTimeForTheRelatedArtistsSongs() {
         agentsMs = 10_000
         val started = System.currentTimeMillis()

@@ -81,11 +81,15 @@ class Mixes(
 
     /**
      * [count] songs to queue next. [seed] is [SONG] ([id] in the library, or [artist] and [title] of a song elsewhere) or
-     * [PICKS]. [exclude] is the queue, oldest first, as the apps key songs ("lib/<id>", "yt/<videoId>"): never again,
-     * and its last library songs after the seed steer, so a long radio follows what's playing. Throws [LibraryException]
-     * when Navidrome can't be asked.
+     * [PICKS]. [exclude] is the queue, oldest first, as the apps key songs ("lib/<id>", "yt/<videoId>", a phone file's
+     * key): never again, and its last library songs after the seed steer, so a long radio follows what's playing. The
+     * seed is found in it by [key], its queue key, or else as "lib/<[id]>"; when it isn't there, the whole queue steers.
+     * Throws [LibraryException] when Navidrome can't be asked.
      */
-    fun radio(user: String, login: Map<String, String>, seed: String, id: String?, artist: String?, title: String?, exclude: List<String>, count: Int): Radio {
+    fun radio(
+        user: String, login: Map<String, String>, seed: String, id: String?, artist: String?, title: String?, exclude: List<String>, count: Int,
+        key: String? = null,
+    ): Radio {
         val started = System.currentTimeMillis()
         val deadline = started + RADIO_MS
         val recent = exclude.takeLast(MAX_EXCLUDE)
@@ -94,7 +98,8 @@ class Mixes(
         val random = Random(listOf(user, seed, id, artist, title, queued.size, queued.lastOrNull()).hashCode())
         val index = library.artists(user, login)
         // Only what was queued after the seed steers: the songs before it were played before the radio started.
-        val afterSeed = recent.drop(id?.let { recent.lastIndexOf("lib/$it") + 1 } ?: 0)
+        val from = listOfNotNull(key, id?.let { "lib/$it" }).map(recent::lastIndexOf).firstOrNull { it >= 0 } ?: -1
+        val afterSeed = recent.drop(from + 1)
         val tail = afterSeed.filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }.filter { it != id }.takeLast(3)
             .map { start(radioPool) { library.song(login, it) } }.mapNotNull { it.await(deadline) }
         val radio = if (seed == PICKS) picksRadio(user, login, queued, tail, index, count, random, deadline)
