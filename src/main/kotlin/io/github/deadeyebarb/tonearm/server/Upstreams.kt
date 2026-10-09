@@ -309,8 +309,9 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
      */
     private fun realArtist(foreignAlbumId: String, claimed: String?): JsonObject? {
         val (status, known) = lidarr.get("api/v1/album", "foreignAlbumId=" + java.net.URLEncoder.encode(foreignAlbumId, Charsets.UTF_8))
-        if (status != 200) return null
-        val inLidarr = parsed { json.parseToJsonElement(known).jsonArray.firstOrNull() as? JsonObject }
+        // An album it hasn't got is [] (or a 404 from some); an error or no answer at all can't tell.
+        if (status != 200 && status != 404) return null
+        val inLidarr = if (status == 404) null else parsed { json.parseToJsonElement(known).jsonArray.firstOrNull() as? JsonObject }
         inLidarr?.string("artistId")?.let { id -> return owners(listOf("artist/$id"))?.firstOrNull() }
         val mbid = if (UUID.matches(foreignAlbumId)) {
             val (found, body) = lidarr.get("api/v1/album/lookup", "term=" + java.net.URLEncoder.encode("lidarr:$foreignAlbumId", Charsets.UTF_8))

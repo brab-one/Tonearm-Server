@@ -85,12 +85,15 @@ class PicksFolderTest {
                     path == "/api/v1/album" && ex.requestURI.query.orEmpty().startsWith("foreignAlbumId=") -> when (ex.requestURI.query) {
                         "foreignAlbumId=mb-pyg" -> 200 to """[{"id":21,"title":"Pygmalion","artistId":11}]"""
                         "foreignAlbumId=mb-broken" -> 500 to """{"message":"database is locked"}"""
+                        // Some Lidarrs say they haven't got an album like this.
+                        "foreignAlbumId=mb-gone", "foreignAlbumId=$GONE" -> 404 to """{"message":"NotFound"}"""
                         else -> 200 to "[]"
                     }
                     path == "/api/v1/album/lookup" -> 200 to when (ex.requestURI.query) {
                         "term=lidarr%3A$SOUVLAKI", "term=lidarr:$SOUVLAKI" -> """[{"title":"Souvlaki","artist":{"artistName":"Slowdive","foreignArtistId":"mb-slowdive","path":"/picks/carol/Slowdive"}}]"""
                         "term=lidarr%3A$KID_A", "term=lidarr:$KID_A" -> """[{"title":"Kid A","artist":{"artistName":"Radiohead","foreignArtistId":"mb-radiohead"}}]"""
                         "term=lidarr%3A$MEZZANINE", "term=lidarr:$MEZZANINE" -> """[{"title":"Mezzanine","artist":{"artistName":"Massive Attack","foreignArtistId":"$MASSIVE_ATTACK"}}]"""
+                        "term=lidarr%3A$GONE", "term=lidarr:$GONE" -> """[{"title":"Pygmalion","artist":{"artistName":"Slowdive","foreignArtistId":"mb-slowdive","path":"/picks/carol/Slowdive"}}]"""
                         else -> "[]"
                     }
                     path == "/api/v1/artist/10" -> 200 to """{"id":10,"artistName":"Low","path":"/picks/bob/Low","rootFolderPath":"/picks/bob"}"""
@@ -217,6 +220,8 @@ class PicksFolderTest {
         const val KID_A = "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e"
         const val MEZZANINE = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
         const val MASSIVE_ATTACK = "10adbe5e-a2c0-4bf3-8249-2b4cbf6e6ca8"
+        /** One Lidarr answers 404 for when asked whether it has it. */
+        const val GONE = "7e8f9a0b-1c2d-4e3f-9a4b-5c6d7e8f9a0b"
     }
 
     @Test
@@ -237,6 +242,10 @@ class PicksFolderTest {
         assertEquals(409, album("456@deezer", "mb-slowdive").first)
         // When Lidarr can't say, nothing is let through.
         assertEquals(502, album("mb-broken", "mb-radiohead").first)
+        // A 404 for an album is one it hasn't got, like an empty list: the metadata or the request's artist decides.
+        assertEquals(200, album("mb-gone", "mb-newcomer").first)
+        assertEquals(409, album("mb-gone", "mb-slowdive").first)
+        assertEquals(409, album(GONE, "mb-newcomer").first)
         // Monitoring or searching for carol's albums would download into her folder too, in any spelling.
         fun put(body: String) = call("/connect-tonearm/lidarr/api/v1/album/monitor", bob, "PUT", body).first
         assertEquals(409, put("""{"albumIds":[21],"monitored":true}"""))
