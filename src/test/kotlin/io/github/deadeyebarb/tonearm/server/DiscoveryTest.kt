@@ -36,7 +36,7 @@ class DiscoveryTest {
                     "getAlbumList2.view" -> if ("frequent" in query) """"albumList2":{"album":[{"artist":"Portishead"},{"artist":"Portishead"},{"artist":"Radiohead"}]}"""
                     else """"albumList2":{"album":[{"artist":"Massive Attack"}]}"""
                     "getStarred2.view" -> """"starred2":{"artist":[{"name":"Radiohead"}]}"""
-                    "getArtists.view" -> """"artists":{"index":[{"artist":[{"name":"Portishead"},{"name":"Radiohead"},{"name":"Massive Attack"}]}]}"""
+                    "getArtists.view" -> """"artists":{"index":[{"artist":[{"name":"Portishead"},{"name":"Radiohead"},{"name":"Massive Attack"},{"name":"Кино"}]}]}"""
                     else -> """"x":1"""
                 }
                 answer(ex, """{"subsonic-response":{"status":"ok",$body}}""")
@@ -49,6 +49,8 @@ class DiscoveryTest {
                     path == "/search/artist" && "q=portishead" in q -> """{"data":[${artist(1, "Portishead")}]}"""
                     path == "/search/artist" && "q=radiohead" in q -> """{"data":[${artist(2, "Radiohead")}]}"""
                     path == "/search/artist" && "q=massive attack" in q -> """{"data":[${artist(3, "Massive Attack")}]}"""
+                    path == "/search/artist" && "q=кино" in q -> """{"data":[${artist(20, "Кино")}]}"""
+                    path == "/artist/20/related" -> """{"data":[${artist(21, "Сплин")},${artist(22, "ДДТ")},${artist(23, "米津玄師")},${artist(3, "Massive Attack")}]}"""
                     path == "/artist/1/related" -> """{"data":[${artist(3, "Massive Attack")},${artist(10, "Tricky")},${artist(11, "Björk")},${artist(12, "Air")}]}"""
                     path == "/artist/2/related" -> """{"data":[${artist(11, "Björk")},${artist(13, "Muse")},${artist(1, "Portishead")}]}"""
                     path == "/artist/3/related" -> """{"data":[${artist(10, "Tricky")},${artist(1, "Portishead")}]}"""
@@ -136,6 +138,13 @@ class DiscoveryTest {
         val (name, similar) = discovery.similar("alice", login, "portishead")
         assertEquals("Portishead", name)
         assertEquals(listOf("Massive Attack" to true, "Tricky" to false, "Björk" to false, "Air" to false), similar.map { it.artist to it.inLibrary })
+    }
+
+    @Test
+    fun artistsInOtherScriptsArentAllInTheLibrary() {
+        val (name, similar) = discovery.similar("alice", login, "Кино")
+        assertEquals("Кино", name)
+        assertEquals(listOf("Сплин" to false, "ДДТ" to false, "米津玄師" to false, "Massive Attack" to true), similar.map { it.artist to it.inLibrary })
     }
 
     @Test

@@ -127,7 +127,7 @@ class RecommendationsTest {
         assertEquals(listOf("Mazzy Star"), checked.ask(checked.taste("alice", login), before = emptyList()).map { it.artist })
         val unsure = Recommendations(OllamaAi(url, "qwen2.5", pull = false), url, Files.createTempDirectory("tonearm-recs").toFile(), AlbumCheck { error("Lidarr's search failed") })
         assertEquals(listOf("Mazzy Star", "Tricky"), unsure.ask(unsure.taste("alice", login), before = emptyList()).map { it.artist })
-        assertEquals(Recommendations.bareTitle("OK Computer"), Recommendations.bareTitle("OK Computer (Collector's Edition) [Remastered]"))
+        assertEquals(Recommendations.looseTitle("OK Computer"), Recommendations.looseTitle("OK Computer (Collector's Edition) [Remastered]"))
     }
 
     @Test
@@ -481,5 +481,84 @@ class RecommendationsTest {
         engine.ask(engine.taste("alice", login), emptyList())
         assertFalse("Sia – Chandelier (3)" in asked!!)
         assertTrue("songs" in Json.parseToJsonElement(asked!!).jsonObject["format"].toString())
+    }
+
+    /** An AI that answers [answer] to every question, and keeps what it was asked. */
+    private class FakeAi(private val answer: (String) -> String) : Ai {
+        override val name = "Ollama"
+        override val model = "qwen2.5"
+        val prompts: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+
+        override fun answer(system: String, prompt: String, schema: kotlinx.serialization.json.JsonObject, temperature: Double, think: Boolean): AiAnswer {
+            prompts += prompt
+            return AiAnswer(answer(prompt))
+        }
+    }
+
+    private fun Recommendations.searchFor(query: String, now: Long = System.currentTimeMillis()): AiSearch {
+        var found = search(query, now)
+        repeat(100) { if (found.running) { Thread.sleep(50); found = search(query, now) } }
+        return found
+    }
+
+    @Test
+    fun aFailedAiSearchIsShownBrieflyThenAskedAgain() {
+        var down = true
+        val ai = FakeAi { if (down) throw java.net.ConnectException("Connection refused") else """{"results":[{"artist":"Portishead","title":"Glory Box","why":"Trip-hop."}]}""" }
+        val engine = Recommendations(ai, "http://127.0.0.1:${fake.address.port}", Files.createTempDirectory("tonearm-recs").toFile())
+        val failed = engine.searchFor("dreamy trip hop")
+        assertTrue(failed.problem!!.startsWith("Ollama: "), failed.problem)
+        down = false
+        // The apps, asking again while it ran, see the failure; a search a little later asks the AI again.
+        assertEquals(failed, engine.search("dreamy trip hop"))
+        val later = engine.searchFor("dreamy trip hop", System.currentTimeMillis() + 31_000)
+        assertEquals(null, later.problem)
+        assertEquals(listOf("Portishead"), later.hits.map { it.artist })
+        assertEquals(2, ai.prompts.size)
+    }
+
+    @Test
+    fun searchesInOtherScriptsAreSearchesOfTheirOwn() {
+        val ai = FakeAi { prompt ->
+            if ("Кино" in prompt) """{"results":[{"artist":"Кино","title":"Группа крови","why":"."},{"artist":"Кино","title":"Звезда по имени Солнце","why":"."},{"artist":"Аквариум","title":"Город золотой","why":"."}]}"""
+            else """{"results":[{"artist":"Аквариум","title":"Город золотой","why":"."}]}"""
+        }
+        val engine = Recommendations(ai, "http://127.0.0.1:${fake.address.port}", Files.createTempDirectory("tonearm-recs").toFile())
+        assertEquals(listOf("Группа крови", "Звезда по имени Солнце", "Город золотой"), engine.searchFor("Кино").hits.map { it.title })
+        assertEquals("Аквариум", engine.searchFor("Аквариум").query)
+        assertEquals(2, ai.prompts.size)
+        assertEquals(Recommendations.searchKey("Dreamy 90s Trip-Hop"), Recommendations.searchKey("dreamy 90s  trip hop"))
+        assertEquals(Recommendations.searchKey("Sigur Rós"), Recommendations.searchKey("sigur ros"))
+        for ((a, b) in listOf("乃木坂46" to "日向坂46", "The Who" to "Who", "rock and roll" to "rock & roll", "!!!" to "?")) {
+            assertTrue(Recommendations.searchKey(a) != Recommendations.searchKey(b), "$a and $b")
+        }
+    }
+
+    @Test
+    fun moreLikeThisWaitsForTheRunGoingInsteadOfBeingDropped() {
+        val release = java.util.concurrent.CountDownLatch(1)
+        val ai = FakeAi {
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            """{"recommendations":[{"artist":"Mazzy Star","album":"So Tonight That I Might See","year":1993,"songs":[],"why":"Dreamy."}]}"""
+        }
+        val engine = Recommendations(ai, "http://127.0.0.1:${fake.address.port}", Files.createTempDirectory("tonearm-recs").toFile())
+        assertTrue(engine.get("alice", login, refresh = true).running)
+        val seed = "the album “Dummy” by Portishead"
+        assertTrue(engine.get("alice", login, refresh = true, seed = seed).running)
+        release.countDown()
+        var picks = engine.get("alice", login, refresh = false)
+        repeat(100) { if (picks.running) { Thread.sleep(50); picks = engine.get("alice", login, refresh = false) } }
+        assertEquals(seed, picks.seed)
+        assertEquals(2, ai.prompts.size)
+        assertTrue("more like $seed" in ai.prompts.last())
+    }
+
+    @Test
+    fun skipsCountForTheirOwnArtistInAnyScript() {
+        val history = History(Files.createTempDirectory("tonearm-history").toFile())
+        val now = System.currentTimeMillis()
+        history.add("alice", (1..10).map { Played(now - it * 60_000L, "Сплин", "Song $it", durationMs = 200_000, listenedMs = 200_000) } +
+            (1..4).map { Played(now - it * 120_000L - 1, "Кино", "Skip $it", durationMs = 200_000, listenedMs = 5_000) })
+        assertEquals(listOf("Кино"), engine(history = history).taste("alice", login).skipped)
     }
 }

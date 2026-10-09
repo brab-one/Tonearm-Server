@@ -311,7 +311,8 @@ class Discovery(
         private const val OUTSIDE = 4
         private val LIVE = Regex("""\b(live|remaster(ed)?|deluxe|anniversary|demo)\b""", RegexOption.IGNORE_CASE)
 
-        private fun normalize(text: String) = Recommendations.normalize(text)
+        /** Names as the picks compare them, so artists in other scripts don't all count as one. */
+        private fun normalize(text: String) = Recommendations.loose(text)
         private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
         private fun JsonObject.long(key: String) = (this[key] as? JsonPrimitive)?.longOrNull ?: 0L
     }

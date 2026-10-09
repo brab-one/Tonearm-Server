@@ -147,6 +147,10 @@ class Recommendations(
     private val dir = File(dataDir, "recommendations").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val running = ConcurrentHashMap.newKeySet<String>()
+    /** Hands [running] over from a run that ends to the "more like this" waiting for it. */
+    private val lock = Any()
+    /** A "more like this" asked for while a run was going, with the listening read then: started when that run ends (the latest ask wins). */
+    private val pending = HashMap<String, Pair<Taste, String>>()
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "recommendations").apply { isDaemon = true } }
     private val searchWorker = Executors.newSingleThreadExecutor { Thread(it, "ai-search").apply { isDaemon = true } }
     /** AI searches by query, for a day: the same search from anyone gets the same answer. */
@@ -159,52 +163,67 @@ class Recommendations(
     fun get(user: String, login: Map<String, String>, refresh: Boolean, seed: String? = null): AiPicks {
         val stored = load(user)
         val due = refresh || seed != null || stored.madeAt == 0L || System.currentTimeMillis() - stored.madeAt > MAX_AGE_MS
-        if (due && running.add(user)) {
+        // The listening is read now, while the login is at hand; with a run going, only a "more like this" needs it, for later.
+        if (due && (seed != null || user !in running)) {
             val taste = try {
                 taste(user, login)
             } catch (e: Exception) {
-                running.remove(user)
                 return stored.copy(problem = "Couldn't read your listening from Navidrome: ${e.message}")
             }
-            worker.execute {
-                val started = System.currentTimeMillis()
-                try {
-                    val outcome = run(taste, stored.picks, seed)
-                    val picks = outcome.picks.filter { history?.isDismissed(user, it.artist, it.album) != true }
-                    val madeAt = System.currentTimeMillis()
-                    // An answer with nothing usable keeps the picks there are.
-                    save(user, if (picks.isEmpty()) load(user).copy(problem = "The AI had nothing usable this time") else AiPicks(picks, madeAt, model = model, seed = seed))
-                    log(user, outcome.copy(picks = picks), madeAt, seed, stored)
-                } catch (e: Exception) {
-                    val problem = "${ai.name}: ${e.message ?: e.javaClass.simpleName}"
-                    save(user, load(user).copy(problem = problem))
-                    // What the model was asked and how far it got: that's what tells why it failed.
-                    val failed = e as? RunFailed
-                    failed?.let { runCatching { DataFiles.write(File(dir, name(user) + ".prompt.txt"), it.prompt) } }
-                    val answer = failed?.answer
-                    log(user, PickRun(
-                        started, model, seed, promptTokens = answer?.promptTokens, outputTokens = answer?.outputTokens,
-                        thinkingChars = answer?.thinkingChars, stop = answer?.stop, seconds = (System.currentTimeMillis() - started) / 1000, problem = problem,
-                    ))
-                } finally {
-                    running.remove(user)
+            val idle = synchronized(lock) {
+                if (running.add(user)) true else {
+                    if (seed != null) pending[user] = taste to seed
+                    false
                 }
             }
+            if (idle) start(user, taste, seed)
         }
         return load(user).let { it.copy(picks = it.picks.filter { p -> history?.isDismissed(user, p.artist, p.album) != true }, running = user in running, model = model) }
     }
 
+    /** Makes [user]'s picks in the background, then the "more like this" that came in meanwhile, if one did. */
+    private fun start(user: String, taste: Taste, seed: String?) {
+        worker.execute {
+            val stored = load(user)
+            val started = System.currentTimeMillis()
+            try {
+                val outcome = run(taste, stored.picks, seed)
+                val picks = outcome.picks.filter { history?.isDismissed(user, it.artist, it.album) != true }
+                val madeAt = System.currentTimeMillis()
+                // An answer with nothing usable keeps the picks there are.
+                save(user, if (picks.isEmpty()) load(user).copy(problem = "The AI had nothing usable this time") else AiPicks(picks, madeAt, model = model, seed = seed))
+                log(user, outcome.copy(picks = picks), madeAt, seed, stored)
+            } catch (e: Exception) {
+                val problem = "${ai.name}: ${e.message ?: e.javaClass.simpleName}"
+                save(user, load(user).copy(problem = problem))
+                // What the model was asked and how far it got: that's what tells why it failed.
+                val failed = e as? RunFailed
+                failed?.let { runCatching { DataFiles.write(File(dir, name(user) + ".prompt.txt"), it.prompt) } }
+                val answer = failed?.answer
+                log(user, PickRun(
+                    started, model, seed, promptTokens = answer?.promptTokens, outputTokens = answer?.outputTokens,
+                    thinkingChars = answer?.thinkingChars, stop = answer?.stop, seconds = (System.currentTimeMillis() - started) / 1000, problem = problem,
+                ))
+            } finally {
+                // A waiting "more like this" keeps the user running and goes next.
+                val next = synchronized(lock) { pending.remove(user).also { if (it == null) running.remove(user) } }
+                next?.let { (nextTaste, nextSeed) -> start(user, nextTaste, nextSeed) }
+            }
+        }
+    }
+
     /**
      * What the AI makes of a search: songs or albums that fit it, also when it's a description ("dreamy 90s trip
-     * hop", "that song with the whistling"). Runs in the background; ask again for the answer.
+     * hop", "that song with the whistling"). Runs in the background; ask again for the answer. A failure is kept
+     * only long enough for the apps to see it, then the next search asks again.
      */
-    fun search(query: String): AiSearch {
-        val key = normalize(query)
-        val now = System.currentTimeMillis()
-        searches[key]?.takeIf { it.first.running || now - it.second < SEARCH_MS }?.let { return it.first }
+    fun search(query: String, now: Long = System.currentTimeMillis()): AiSearch {
+        val key = searchKey(query)
+        fun kept(entry: Pair<AiSearch, Long>) = entry.first.running || now - entry.second < if (entry.first.problem != null) FAILED_SEARCH_MS else SEARCH_MS
+        searches[key]?.takeIf(::kept)?.let { return it.first }
         val started = AiSearch(query, running = true)
         searches[key] = started to now
-        if (searches.size > 500) searches.entries.removeIf { now - it.value.second > SEARCH_MS }
+        if (searches.size > 500) searches.values.removeIf { !kept(it) }
         searchWorker.execute {
             val done = try {
                 AiSearch(query, askSearch(query))
@@ -246,7 +265,7 @@ class Recommendations(
             val o = element as? JsonObject ?: return@mapNotNull null
             val hit = AiHit(o.str("artist").trim(), o.str("title").trim().ifEmpty { null }, o.str("album").trim().ifEmpty { null }, o.str("why").trim())
             hit.takeIf { it.artist.isNotEmpty() && (it.title != null || it.album != null) }
-        }.distinctBy { normalize(it.artist) + "|" + normalize(it.title ?: it.album.orEmpty()) }.take(8)
+        }.distinctBy { loose(it.artist) + "|" + (it.title?.let(::loose) ?: looseTitle(it.album.orEmpty())) }.take(8)
     }
 
     fun toJson(search: AiSearch): JsonObject = json.encodeToJsonElement(AiSearch.serializer(), search).jsonObject
@@ -290,9 +309,9 @@ class Recommendations(
             .filter { loose(Played.mainArtist(it.artist)) !in onTrial && History.songKey(it.artist, it.title) !in dislikedKeys && !history!!.isDismissed(user, Played.mainArtist(it.artist)) }
             .take(25).map { "${it.artist} – ${it.title} (${it.plays})" }
         // Skips only say something next to few plays: everyone skips their favourites now and then.
-        val skippers = played.filter { it.at > now - 90 * DAY_MS && it.skipped }.groupingBy { it.mainArtist }.eachCount()
-            .filter { (artist, skips) -> skips >= 3 && skips > 2 * (quarter.firstOrNull { normalize(it.artist) == normalize(artist) }?.plays ?: 0) }
-            .keys.take(20)
+        val skippers = played.filter { it.at > now - 90 * DAY_MS && it.skipped }.groupBy { loose(it.mainArtist) }
+            .filter { (artist, skips) -> skips.size >= 3 && skips.size > 2 * (quarter.firstOrNull { loose(it.artist) == artist }?.plays ?: 0) }
+            .values.take(20).map { skips -> skips.groupingBy { it.mainArtist }.eachCount().maxBy { it.value }.key }
         fun mine(albums: List<JsonObject>) = albums.filter { loose(Played.mainArtist(it.str("artist"))) !in onTrial }.map(::label)
         return Taste(
             mine(albums("frequent", 40 + onTrial.size)).take(40), mine(albums("recent", 25 + onTrial.size)).take(25), liked.distinct().take(80), library,
@@ -574,6 +593,8 @@ class Recommendations(
         private const val SYSTEM = "You are a music critic with deep knowledge of albums across all genres. Answer only with the requested JSON."
         private const val MIN_NEW = 3
         private const val SEARCH_MS = 24 * 3_600_000L
+        /** A failed AI search is shown this long (longer than the apps take to ask again), then tried again. */
+        private const val FAILED_SEARCH_MS = 30_000L
         /** Picks shown (and the first few downloaded by weekly picks). */
         private const val KEEP = 12
         /** How long an earlier pick's plays count as trying it out. */
@@ -628,15 +649,18 @@ class Recommendations(
             put("required", JsonArray(listOf(JsonPrimitive("recommendations"))))
         }
 
-        /** An album title without "(Deluxe Edition)", "[Remastered]" and the like, for comparing. */
-        fun bareTitle(title: String) = normalize(title.replace(Regex("\\s*[(\\[][^)\\]]*[)\\]]"), ""))
+        /**
+         * A search as the AI is asked it, for keeping its answer: case, accents, punctuation and spacing don't matter, every
+         * script's letters and every word do ("Trip-Hop" is "trip hop", but "The Who" isn't "Who" and "Кино" isn't "Аквариум").
+         */
+        fun searchKey(query: String): String {
+            val lower = query.trim().lowercase()
+            val folded = Normalizer.normalize(ACCENTS.replace(Normalizer.normalize(lower, Normalizer.Form.NFKD), ""), Normalizer.Form.NFC)
+            return folded.replace(NOT_A_WORD, " ").trim().ifEmpty { lower.replace(SPACES, " ") }
+        }
 
-        /** Lowercase letters and digits only, so case, accents and punctuation don't matter. */
-        fun normalize(text: String): String = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
-            .replace(MARKS, "").replace(NOT_LATIN, "")
-
-        private val MARKS = Regex("\\p{M}")
-        private val NOT_LATIN = Regex("[^a-z0-9]")
+        private val NOT_A_WORD = Regex("[^\\p{L}\\p{N}\\p{M}]+")
+        private val SPACES = Regex("\\s+")
 
         /**
          * A name for comparing: case, accents and punctuation don't matter, "&", "+" and "and" are the same, and a leading
