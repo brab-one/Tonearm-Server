@@ -18,7 +18,8 @@ dependencies {
 application {
     mainClass.set("io.github.deadeyebarb.tonearm.server.MainKt")
     applicationName = "tonearm-server"
-    applicationDefaultJvmArgs = listOf("-Xmx128m", "-Xss512k", "-XX:+UseSerialGC")
+    // Room for a few long listening histories; JAVA_OPTS (e.g. -Xmx512m) gives more.
+    applicationDefaultJvmArgs = listOf("-Xmx256m", "-Xss512k", "-XX:+UseSerialGC")
 }
 
 tasks.jar { manifest { attributes("Implementation-Version" to project.version) } }

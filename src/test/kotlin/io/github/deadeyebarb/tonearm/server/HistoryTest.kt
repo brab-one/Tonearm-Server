@@ -1,8 +1,14 @@
 package io.github.deadeyebarb.tonearm.server
 
+import com.sun.net.httpserver.HttpServer
+import java.io.File
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.http.HttpClient
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -51,5 +57,70 @@ class HistoryTest {
         assertFalse(again.isDismissed("alice", "Tricky", null))
         assertTrue(again.isDismissed("alice", "Mazzy Star", "Anything"))
         assertEquals(2, again.dismissed("alice").size)
+    }
+
+    @Test
+    fun playsThatCantBeSavedArentKeptSoTheAppsNextTryAddsThem() {
+        val history = History(dir)
+        history.add("alice", listOf(play(1, "Sia", "Rewrite")))
+        val file = File(dir, "history/alice.jsonl")
+        val sunday = play(0, "Sia", "Sunday")
+        file.setWritable(false)
+        try {
+            assertFailsWith<IOException> { history.add("alice", listOf(sunday)) }
+            assertEquals(1, history.played("alice").size)
+        } finally {
+            file.setWritable(true)
+        }
+        assertEquals(1, history.add("alice", listOf(sunday)))
+        assertEquals(listOf("Rewrite", "Sunday"), History(dir).played("alice").map { it.title })
+    }
+
+    @Test
+    fun aNoThatCantBeSavedIsntKeptEither() {
+        val history = History(dir)
+        val folder = File(dir, "history").apply { setWritable(false) }
+        try {
+            assertFailsWith<IOException> { history.dismiss("alice", "Tricky", null) }
+            assertFailsWith<IOException> { history.dislike("alice", "Tricky", "Overcome", null, on = true) }
+        } finally {
+            folder.setWritable(true)
+        }
+        assertFalse(history.isDismissed("alice", "Tricky"))
+        assertTrue(history.dislikedSongs("alice").isEmpty())
+    }
+
+    @Test
+    fun malojasHistoryComesOverAPageAtATime() {
+        val scrobbles = (0 until 4_500).map { """{"time":${1_700_000_000 + it * 300},"track":{"artists":["Artist ${it % 40}"],"title":"Song $it","length":200},"duration":200}""" }
+        var pagesKnown = true
+        val pages = mutableListOf<Int>()
+        val maloja = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            createContext("/apis/mlj_1/scrobbles") { ex ->
+                val q = ex.requestURI.query.split('&').associate { it.substringBefore('=') to it.substringAfter('=') }
+                val perPage = q.getValue("perpage").toInt()
+                val page = if (pagesKnown) q.getValue("page").toInt() else 0
+                synchronized(pages) { pages += q.getValue("page").toInt() }
+                val next = if ((page + 1) * perPage < scrobbles.size) "\"?page=${page + 1}\"" else "null"
+                val pagination = if (pagesKnown) ""","pagination":{"page":$page,"next_page":$next}""" else ""
+                val bytes = """{"status":"ok","list":[${scrobbles.drop(page * perPage).take(perPage).joinToString(",")}]$pagination}""".encodeToByteArray()
+                ex.sendResponseHeaders(200, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
+            start()
+        }
+        try {
+            val url = "http://127.0.0.1:${maloja.address.port}"
+            assertEquals(4_500, History(dir).importMaloja("alice", url, null, HttpClient.newHttpClient()))
+            assertEquals(listOf(0, 1, 2), pages)
+            assertEquals(4_500, History(dir).played("alice").size)
+            // A Maloja without pages answers the same each time: that's all there is from it, not the same plays again and again.
+            pagesKnown = false
+            pages.clear()
+            assertEquals(2_000, History(Files.createTempDirectory("tonearm-history").toFile()).importMaloja("alice", url, null, HttpClient.newHttpClient()))
+            assertEquals(listOf(0, 1), pages)
+        } finally {
+            maloja.stop(0)
+        }
     }
 }

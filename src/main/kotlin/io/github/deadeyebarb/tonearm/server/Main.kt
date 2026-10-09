@@ -79,8 +79,9 @@ private fun malojaImport(url: String, key: String?, users: String?, history: His
             Thread({
                 try {
                     history.importMaloja(user, url, key, http)?.let { println("Brought $it plays over from Maloja into $user's history; MALOJA_URL can go now") }
-                } catch (e: Exception) {
-                    System.err.println("Couldn't bring Maloja's history over (tries again on the next start): ${e.message}")
+                } catch (e: Throwable) {
+                    // Running out of memory too: said here, not left to a bare stack trace.
+                    System.err.println("Couldn't bring Maloja's history over (tries again on the next start): ${e.message ?: e.javaClass.simpleName}")
                 }
             }, "maloja-import").apply { isDaemon = true }.start()
         }

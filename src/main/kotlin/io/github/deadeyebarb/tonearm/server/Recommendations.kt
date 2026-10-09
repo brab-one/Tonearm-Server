@@ -527,10 +527,10 @@ class Recommendations(
     /** Adds [lines] to a log, which keeps its last [keep] lines. */
     private fun appendLog(file: File, lines: List<String>, keep: Int) {
         if (lines.isEmpty()) return
-        DataFiles.append(file, lines.joinToString("") { it + "\n" })
+        DataFiles.appendLines(file, lines.asSequence())
         if (file.length() > keep * 300L) {
             val all = file.readLines()
-            if (all.size > keep) DataFiles.write(file, all.takeLast(keep).joinToString("") { it + "\n" })
+            if (all.size > keep) DataFiles.writeLines(file, all.takeLast(keep).asSequence())
         }
     }
 
