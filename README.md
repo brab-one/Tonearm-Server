@@ -27,6 +27,27 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   they're played a few times again.
 - **Disliked songs**: the apps' thumbs-down on a song is kept here, so the phone and the desktop share it. The
   AI is told to avoid music like them, discovery weighs their artists down, and "Ask the AI" leaves them out.
+- **Radio**, no AI needed: endless radio from a song (in the library, or one from YouTube Music or a file that the
+  library has too) or from your picks, answered in seconds from your own library: Navidrome's similar songs,
+  library artists like it (Navidrome's similar artists and Deezer's related ones), the same artist and its genre.
+  Picks radio starts with your newest weekly picks and goes on with what you liked this month and artists like
+  them. It leaves out what's queued, disliked songs, artists and albums said no to and what you played in the last
+  6 hours, with at most 2 songs per artist a batch and the artists spaced out. The car's Radio button, the phone's
+  shortcut and the desktop's Picks radio use it; the last songs queued steer the next batch, so a long radio
+  follows what's playing.
+- **Mixes from a sentence**, with an AI: "rainy sunday, mellow jazz" becomes a mix of 30 songs from your
+  library: the songs the AI names that the library has first, then its artists and genres. Each one is kept for
+  the day (Ask again makes a new one), one at a time per user. Without an AI the apps match the words in the
+  library themselves.
+- **Daily mixes**: up to three mixes of 30 songs a day for each user, from the artists they played in the last
+  90 days and liked, grouped by genre (electronic, jazz, metal…) with library artists like them; nothing from
+  yesterday's mixes or the last three days' plays, nothing disliked. The first time an app asks on a new day they're
+  made (a few seconds); a day starts at 04:00 in the app's time zone.
+- **Continue where you left off**: the server keeps each user's last song, place and queue from their devices,
+  also after the desktop quits or the server restarts, so the phone in the car can carry on where the desktop
+  stopped.
+- **Listening stats**: plays, hours, top artists and albums per week or month, and what was played, a page at a
+  time, for the phone's History screen.
 
 Everybody signs in with their own Navidrome login: the apps send the same login they use for music,
 and the server asks Navidrome whether it's valid (and whether they're an admin).
@@ -52,13 +73,14 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    LIDARR_API_KEY=<Lidarr → Settings → General → API Key>
    AI_PROVIDER=ollama
    AI_URL=http://192.168.1.11:11435
+   TZ=Europe/Vienna
    ```
 
    For another AI, see [Choosing the AI](#choosing-the-ai). Everything in the `.env` box reaches the server as it
    is; with a compose file from before 1.5.3, which listed each setting, only the listed ones did, so take the
    new one.
 6. Click **Deploy**. The log lists what's set up:
-   `Tonearm server 1.5.0 on port 8790 …`, then a line each for Lidarr, the AI and discovery.
+   `Tonearm server 1.7.0 on port 8790 …`, then a line each for Lidarr, the AI, discovery and the mixes.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
 
 To update later, open the stack in Dockge and click **Update**.
@@ -120,7 +142,8 @@ location /connect-tonearm {
 Nothing to set up: the apps look for the server at the music server's address and use it when it's there.
 Desktop: **Settings → Tonearm Connect** then says "Online through the Tonearm server". Discovery and AI picks
 are under Discover in both apps. Phone 1.10.0 and desktop 1.10.0 send what they play to the history; older
-ones still work, they just don't add to it. Other people on your Navidrome just sign in to Tonearm with their
+ones still work, they just don't add to it. Radio, mixes, daily mixes, the History screen and continuing from the
+desktop come with phone and desktop 1.13.0; older apps just don't show them. Other people on your Navidrome just sign in to Tonearm with their
 own login (and their own client certificate, if your proxy asks for one).
 
 ## Choosing the AI
@@ -206,7 +229,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `NAVIDROME_URL` | (required) | Navidrome as the container reaches it, e.g. `http://192.168.1.11:4533` |
 | `BASE_PATH` | `/connect-tonearm` | The proxy location; requests without the prefix work too |
 | `PORT` | `8790` | |
-| `DATA_DIR` | `/data` | Each user's listening history, shared likes and picks, small JSON files |
+| `DATA_DIR` | `/data` | Each user's listening history, shared likes, picks, daily mixes and where their devices left off, small JSON files |
 | `LIDARR_URL`, `LIDARR_API_KEY` | | Lidarr through the server |
 | `LIDARR_REQUESTS` | `all` | `admins`: only Navidrome admins get Lidarr through the server |
 | `PICKS_FOLDER` | | A folder (as Lidarr sees it) holding one folder per user for their weekly picks ([Private weekly picks](#private-weekly-picks)) |
@@ -217,6 +240,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `OLLAMA_URL`, `OLLAMA_MODEL` | `qwen2.5` | The older way to say Ollama |
 | `MALOJA_URL`, `MALOJA_API_KEY`, `MALOJA_USERS` | | Only to bring a Maloja's history over once ([Moving off Maloja](#moving-off-maloja)) |
 | `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |
+| `TZ` | UTC | The time zone, e.g. `Europe/Vienna`: when a day of daily mixes starts (04:00) for apps that don't send their own |
 | `TRUSTED_PROXIES` | `127.0.0.0/8, ::1, 172.16.0.0/12` | Proxies (addresses or blocks) whose word on who they forward for counts; `none` for no proxy. The default covers a proxy on the same host, which reaches the container through Docker's networks |
 | `JAVA_OPTS` | | e.g. `-Xmx512m` for more memory than the 256 MB the server takes at most |
 
@@ -228,6 +252,13 @@ proxy on another host has to be in `TRUSTED_PROXIES` for that). Lidarr's and the
 non-admins may do in Lidarr is checked call by call (their requests go into one of Lidarr's root folders,
 without tags). AI picks are made in the background (a few minutes on a small GPU), kept for a week, and
 renewed when a user asks; discovery picks are kept for a day.
+
+Radio, mixes and daily mixes ask Navidrome with the user's own login, so they only ever hold what that user may
+see. A mix from a sentence takes the AI for half a minute or so (longer when it's busy with someone's weekly
+picks); the log has a line for each (`AI mix for alice ("rainy sunday, mellow jazz"): 18 of 25 songs found, 9
+artists, 2 genres, 31 s`), and `DATA_DIR/mixes/<user>.mix-prompt.txt` holds what the AI was last asked. Daily mixes
+live in `DATA_DIR/mixes/<user>.daily.json`, where each device left off in `DATA_DIR/connect/<user>.json` (the two
+devices that played last, for 14 days).
 
 ## Building it yourself
 
