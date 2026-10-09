@@ -217,9 +217,13 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `OLLAMA_URL`, `OLLAMA_MODEL` | `qwen2.5` | The older way to say Ollama |
 | `MALOJA_URL`, `MALOJA_API_KEY`, `MALOJA_USERS` | | Only to bring a Maloja's history over once ([Moving off Maloja](#moving-off-maloja)) |
 | `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |
+| `TRUSTED_PROXIES` | `127.0.0.0/8, ::1, 172.16.0.0/12` | Proxies (addresses or blocks) whose word on who they forward for counts; `none` for no proxy. The default covers a proxy on the same host, which reaches the container through Docker's networks |
 
-Every request except `/connect-tonearm/health` needs a valid Navidrome login. An address with 20 failed
-logins in 5 minutes is turned away for a while. Lidarr's and the AI's keys never leave the server; what
+Every request except `/connect-tonearm/health` needs a valid Navidrome login. A user with 20 different failed
+logins from one address in 5 minutes is turned away there for a while; everyone else behind that address still
+gets in, and a device retrying an old password counts once. An address with 200 failed logins for anyone is
+turned away too. The address is the one the request came from, or the one a trusted proxy says it got it from (a
+proxy on another host has to be in `TRUSTED_PROXIES` for that). Lidarr's and the AI's keys never leave the server; what
 non-admins may do in Lidarr is checked call by call (their requests go into one of Lidarr's root folders,
 without tags). AI picks are made in the background (a few minutes on a small GPU), kept for a week, and
 renewed when a user asks; discovery picks are kept for a day.

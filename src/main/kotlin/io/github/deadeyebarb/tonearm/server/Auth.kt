@@ -16,13 +16,18 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Who is calling: the apps send their usual Subsonic login (u + t/s, u + p, or apiKey) and this asks
  * Navidrome whether it's valid, and whether the user is one of its admins. Valid logins are remembered
- * for a few minutes; a client address with many failed attempts is turned away for a while.
+ * for a few minutes; a user with many failed attempts from one client address is turned away for a while
+ * (and so is an address trying many users).
  */
 class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
     private val base = navidromeUrl.trimEnd('/')
     private val json = Json { ignoreUnknownKeys = true }
     private val valid = ConcurrentHashMap<String, Pair<Result.Ok, Long>>()
-    private val failures = ConcurrentHashMap<String, MutableList<Long>>()
+    /**
+     * Failed logins of the last [FAILURE_WINDOW_MS], by client address and user and by address alone: when each
+     * different login last failed, so a device retrying an old password counts once instead of as many guesses.
+     */
+    private val failures = ConcurrentHashMap<String, MutableMap<String, Long>>()
 
     sealed interface Result {
         data class Ok(val user: String, val admin: Boolean = false) : Result
@@ -38,10 +43,12 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
             return Result.Missing
         }
         val now = System.currentTimeMillis()
-        val recent = failures[client]?.let { list -> synchronized(list) { list.removeIf { now - it > FAILURE_WINDOW_MS }; list.size } } ?: 0
-        if (recent >= MAX_FAILURES) return Result.TooMany
         val key = sha256(auth.toSortedMap().entries.joinToString("&"))
+        // A login known to be good gets in, whatever failed from the same address.
         valid[key]?.takeIf { now < it.second }?.let { return it.first }
+        // Counted per user: one device with an old password doesn't lock out everyone behind the same address.
+        val who = client + "|" + (auth["u"]?.lowercase()?.take(64) ?: ("apiKey:" + sha256(auth["apiKey"].orEmpty()).take(16)))
+        if (recentFailures(who, now) >= MAX_FAILURES || recentFailures(client, now) >= MAX_CLIENT_FAILURES) return Result.TooMany
 
         val endpoint = if (auth.containsKey("apiKey")) "tokenInfo" else "ping"
         val response = try {
@@ -50,19 +57,40 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
             return Result.Unreachable(e.message.orEmpty())
         }
         if (response["status"]?.jsonPrimitive?.contentOrNull != "ok") {
-            failures.computeIfAbsent(client) { mutableListOf() }.let { synchronized(it) { it += now } }
+            failed(who, key, now)
+            failed(client, key, now)
             return Result.Rejected
         }
         val name = (if (endpoint == "tokenInfo") response["tokenInfo"]?.jsonObject?.get("username")?.jsonPrimitive?.contentOrNull else auth["u"])
             ?: return Result.Rejected
-        // Users may look themselves up; Navidrome says there whether they're an admin.
-        val admin = runCatching {
+        // Users may look themselves up; Navidrome says there whether they're an admin. When it can't be asked, that
+        // isn't a no: nothing is remembered, and the app tries again.
+        val admin = try {
             subsonic("getUser", auth + ("username" to name))["user"]?.jsonObject?.get("adminRole")?.jsonPrimitive?.contentOrNull == "true"
-        }.getOrDefault(false)
+        } catch (e: Unreachable) {
+            return Result.Unreachable(e.message.orEmpty())
+        }
         val ok = Result.Ok(name.lowercase(), admin)
         valid[key] = ok to now + VALID_MS
         if (valid.size > 10_000) valid.entries.removeIf { now >= it.value.second }
         return ok
+    }
+
+    /** How many different logins failed under [key] lately; the older ones are forgotten, and the key with them. */
+    private fun recentFailures(key: String, now: Long): Int {
+        var count = 0
+        failures.computeIfPresent(key) { _, logins ->
+            logins.values.removeIf { now - it > FAILURE_WINDOW_MS }
+            count = logins.size
+            logins.ifEmpty { null }
+        }
+        return count
+    }
+
+    private fun failed(key: String, login: String, now: Long) {
+        failures.compute(key) { _, logins -> (logins ?: HashMap()).apply { put(login, now) } }
+        // Addresses that stopped trying are let go of now and then, so the map can't keep growing.
+        if (failures.size > MAX_TRACKED) failures.keys.forEach { recentFailures(it, now) }
     }
 
     private class Unreachable(message: String) : Exception(message)
@@ -88,6 +116,10 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
         fun loginOf(query: Map<String, String>): Map<String, String> = AUTH_PARAMS.mapNotNull { k -> query[k]?.let { k to it } }.toMap()
         private const val VALID_MS = 10 * 60_000L
         private const val FAILURE_WINDOW_MS = 5 * 60_000L
+        /** Different failed logins for one user from one address. */
         private const val MAX_FAILURES = 20
+        /** Different failed logins from one address, whoever for: trying one user after another. */
+        private const val MAX_CLIENT_FAILURES = 200
+        private const val MAX_TRACKED = 10_000
     }
 }

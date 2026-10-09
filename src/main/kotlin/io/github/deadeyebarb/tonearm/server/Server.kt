@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.URLDecoder
 import java.util.concurrent.SynchronousQueue
@@ -35,6 +36,8 @@ class TonearmServer(
     private val history: History = History(dataDir),
     /** Brings a Maloja's history over once, for the first user it's meant for. */
     private val malojaImport: ((user: String, admin: Boolean) -> Unit)? = null,
+    /** Proxies whose word on who they forwarded a request for is taken (X-Forwarded-For, X-Real-IP). */
+    private val trustedProxies: List<AddressRange> = AddressRange.LOCAL,
 ) {
     private val base = "/" + basePath.trim('/')
     private val json = Json { ignoreUnknownKeys = true }
@@ -76,9 +79,7 @@ class TonearmServer(
             !path.startsWith("api/") && !path.startsWith("lidarr/") -> return text(exchange, 404, "Not found")
         }
         val query = parseQuery(exchange.requestURI.rawQuery)
-        val client = exchange.requestHeaders.getFirst("X-Real-IP") ?: exchange.requestHeaders.getFirst("X-Forwarded-For")?.substringBefore(',')?.trim()
-            ?: exchange.remoteAddress.address.hostAddress
-        val login = when (val result = auth.check(query, client)) {
+        val login = when (val result = auth.check(query, clientOf(exchange))) {
             is NavidromeAuth.Result.Ok -> result
             NavidromeAuth.Result.Missing -> return error(exchange, 401, "Sign in with your Navidrome login (u + t/s, u + p, or apiKey)")
             NavidromeAuth.Result.Rejected -> return error(exchange, 401, "Navidrome didn't accept that login")
@@ -250,6 +251,19 @@ class TonearmServer(
         send(exchange, 200, response)
     }
 
+    /**
+     * Who's asking, for counting failed logins: the address the request came from or, when that's a trusted proxy, the
+     * one the proxy got it from. Anyone else's forwarding headers are theirs to make up, so they don't count.
+     */
+    private fun clientOf(exchange: HttpExchange): String {
+        val peer = exchange.remoteAddress.address
+        if (trustedProxies.none { it.contains(peer) }) return peer.hostAddress
+        // Each proxy adds the address it heard from at the end: the last one that isn't a trusted proxy is the client.
+        val hops = exchange.requestHeaders["X-Forwarded-For"].orEmpty().flatMap { it.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
+        val forwarded = hops.lastOrNull { hop -> AddressRange.literal(hop)?.let { a -> trustedProxies.none { it.contains(a) } } ?: true } ?: hops.firstOrNull()
+        return (forwarded ?: exchange.requestHeaders.getFirst("X-Real-IP")?.trim()?.ifEmpty { null } ?: peer.hostAddress).take(64)
+    }
+
     private fun parseQuery(raw: String?): Map<String, String> = raw.orEmpty().split('&').filter { it.isNotEmpty() }.associate { part ->
         val k = part.substringBefore('=')
         val v = part.substringAfter('=', "")
@@ -284,5 +298,49 @@ class TonearmServer(
         const val PROTOCOL = 2
         const val MAX_PAYLOAD = 2_000_000
         const val MAX_WAIT_SECONDS = 25
+    }
+}
+
+/** An address or a block of them ("192.168.1.11", "172.16.0.0/12", "::1"), for proxies to trust. */
+class AddressRange private constructor(private val network: ByteArray, private val bits: Int) {
+    fun contains(address: InetAddress): Boolean {
+        val bytes = address.address
+        if (bytes.size != network.size) return false
+        for (i in bytes.indices) {
+            val left = bits - i * 8
+            if (left <= 0) return true
+            val mask = if (left >= 8) 0xff else 0xff shl (8 - left) and 0xff
+            if ((bytes[i].toInt() xor network[i].toInt()) and mask != 0) return false
+        }
+        return true
+    }
+
+    companion object {
+        /** Loopback, and Docker's own networks (172.16.0.0/12), which a proxy on the same host connects from. */
+        val LOCAL = parseList("127.0.0.0/8, ::1, 172.16.0.0/12")
+
+        /** A list like TRUSTED_PROXIES ("192.168.1.11, 10.0.0.0/8"); throws on an entry that isn't an address or block. */
+        fun parseList(text: String): List<AddressRange> = text.split(',', ' ').filter { it.isNotBlank() }.map { entry ->
+            parse(entry) ?: throw IllegalArgumentException("TRUSTED_PROXIES has \"$entry\"; give IP addresses or blocks like 172.16.0.0/12, separated by commas")
+        }
+
+        fun parse(text: String): AddressRange? {
+            val address = literal(text.substringBefore('/')) ?: return null
+            val max = address.address.size * 8
+            val bits = if ('/' in text) text.substringAfter('/').toIntOrNull()?.takeIf { it in 0..max } ?: return null else max
+            return AddressRange(address.address, bits)
+        }
+
+        /** An IP address as written, or null; never a name, which would be looked up. */
+        fun literal(text: String): InetAddress? {
+            val parts = text.split('.')
+            if (parts.size == 4 && parts.all { p -> p.length in 1..3 && p.all { it in '0'..'9' } && p.toInt() <= 255 }) {
+                return InetAddress.getByAddress(parts.map { it.toInt().toByte() }.toByteArray())
+            }
+            // Hex digits and colons, starting with one of them: Java reads that as an IPv6 address, never as a name.
+            fun hex(c: Char) = c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' || c == ':'
+            if (':' !in text || !hex(text[0]) || !text.all { hex(it) || it == '.' }) return null
+            return runCatching { InetAddress.getByName(text) }.getOrNull()
+        }
     }
 }

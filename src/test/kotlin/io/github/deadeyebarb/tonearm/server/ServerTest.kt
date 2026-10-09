@@ -38,6 +38,8 @@ class ServerTest {
     private val received = mutableListOf<List<String?>>()
     private lateinit var dataDir: java.io.File
     private lateinit var history: History
+    /** Navidrome answering getUser with an error page instead of JSON. */
+    private var getUserBroken = false
 
     @BeforeTest
     fun start() {
@@ -53,6 +55,7 @@ class ServerTest {
                 }
                 val body = if (!ok) """{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"""
                 else if (ex.requestURI.path.endsWith("/tokenInfo.view")) """{"subsonic-response":{"status":"ok","tokenInfo":{"username":"Bob"}}}"""
+                else if (ex.requestURI.path.endsWith("/getUser.view") && getUserBroken) "<html>502 Bad Gateway</html>"
                 else if (ex.requestURI.path.endsWith("/getUser.view")) """{"subsonic-response":{"status":"ok","user":{"username":"${q["username"]}","adminRole":${q["username"]?.lowercase() == "alice"}}}}"""
                 else """{"subsonic-response":{"status":"ok"}}"""
                 val bytes = body.encodeToByteArray()
@@ -189,6 +192,69 @@ class ServerTest {
         repeat(20) { call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "guess$it"), headers = mapOf("X-Real-IP" to "10.0.0.9")) }
         assertEquals(429, call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "wonderland"), headers = mapOf("X-Real-IP" to "10.0.0.9")).first)
         assertEquals(200, call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "wonderland"), headers = mapOf("X-Real-IP" to "10.0.0.10")).first)
+    }
+
+    @Test
+    fun oneUsersFailuresDontLockOutOthersOnTheSameAddress() {
+        val known = listOf("u" to "alice", "p" to "wonderland")
+        val home = mapOf("X-Real-IP" to "10.0.0.9")
+        assertEquals(200, call("/connect-tonearm/api/hello", known, headers = home).first)
+        repeat(20) { call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "guess$it"), headers = home) }
+        assertEquals(429, call("/connect-tonearm/api/hello", alice(), headers = home).first)
+        // Her login from before is still good, and bob behind the same address was never the one guessing.
+        assertEquals(200, call("/connect-tonearm/api/hello", known, headers = home).first)
+        assertEquals(200, call("/connect-tonearm/api/hello", bob, headers = home).first)
+    }
+
+    @Test
+    fun aDeviceRetryingAnOldPasswordIsntGuessing() {
+        val desk = mapOf("X-Real-IP" to "10.0.0.11")
+        repeat(30) { assertEquals(401, call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "old password"), headers = desk).first) }
+        assertEquals(200, call("/connect-tonearm/api/hello", alice(), headers = desk).first)
+    }
+
+    @Test
+    fun onlyTrustedProxiesSayWhoTheyForwardFor() {
+        // Each guess claims another address; from a proxy that isn't trusted, they all count for the one they came from.
+        val direct = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test", trustedProxies = emptyList()).start()
+        try {
+            fun hello(login: List<Pair<String, String>>, ip: String) = http.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:${direct.boundPort}/connect-tonearm/api/hello?" + login.joinToString("&") { (k, v) -> "$k=$v" }))
+                    .header("X-Real-IP", ip).header("X-Forwarded-For", ip).POST(HttpRequest.BodyPublishers.noBody()).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            ).statusCode()
+            repeat(20) { hello(listOf("u" to "alice", "p" to "guess$it"), "198.51.100.$it") }
+            assertEquals(429, hello(listOf("u" to "alice", "p" to "wonderland"), "198.51.100.99"))
+        } finally {
+            direct.stop()
+        }
+        // Through a trusted proxy, the address it heard from counts: the last one it added, not what the client wrote first.
+        repeat(20) { call("/connect-tonearm/api/hello", listOf("u" to "alice", "p" to "guess$it"), headers = mapOf("X-Forwarded-For" to "203.0.113.$it, 10.0.0.12")) }
+        assertEquals(429, call("/connect-tonearm/api/hello", alice(), headers = mapOf("X-Forwarded-For" to "203.0.113.99, 10.0.0.12")).first)
+        assertEquals(200, call("/connect-tonearm/api/hello", alice(), headers = mapOf("X-Forwarded-For" to "10.0.0.12, 10.0.0.13")).first)
+    }
+
+    @Test
+    fun trustedProxiesAreAddressesNeverNames() {
+        val docker = AddressRange.parse("172.16.0.0/12")!!
+        assertTrue(docker.contains(java.net.InetAddress.getByName("172.31.255.1")))
+        assertFalse(docker.contains(java.net.InetAddress.getByName("172.32.0.1")))
+        assertFalse(docker.contains(java.net.InetAddress.getByName("::1")))
+        assertTrue(AddressRange.parse("::1")!!.contains(java.net.InetAddress.getByName("::1")))
+        assertTrue(AddressRange.parse("192.168.1.11")!!.contains(java.net.InetAddress.getByName("192.168.1.11")))
+        assertFalse(AddressRange.parse("192.168.1.11")!!.contains(java.net.InetAddress.getByName("192.168.1.12")))
+        for (bad in listOf("localhost", "proxy.lan", "999.1.1.1", "10.0.0.0/33", "dead.beef", "")) assertEquals(null, AddressRange.parse(bad), bad)
+        assertEquals(3, AddressRange.parseList("127.0.0.1, 10.0.0.0/8 ::1").size)
+        assertTrue(runCatching { AddressRange.parseList("npm") }.isFailure)
+    }
+
+    @Test
+    fun anAdminIsntTakenForSomeoneElseWhenNavidromeHiccups() {
+        val login = alice()
+        getUserBroken = true
+        assertEquals(502, call("/connect-tonearm/api/hello", login).first)
+        getUserBroken = false
+        assertEquals("true", api("hello", login)["admin"]!!.jsonPrimitive.content)
     }
 
     @Test
