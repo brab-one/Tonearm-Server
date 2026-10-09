@@ -17,6 +17,7 @@ COPY --chmod=755 entrypoint.sh /usr/local/bin/tonearm-entrypoint
 ENV PORT=8790 BASE_PATH=/connect-tonearm DATA_DIR=/data
 EXPOSE 8790
 VOLUME /data
+# The server answers /health with or without BASE_PATH in front, so how BASE_PATH is written doesn't matter here.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-    CMD wget -qO- "http://127.0.0.1:${PORT}${BASE_PATH}/health" >/dev/null || exit 1
+    CMD wget -qO- "http://127.0.0.1:${PORT:-8790}/health" >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/tonearm-entrypoint"]
