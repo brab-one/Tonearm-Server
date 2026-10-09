@@ -79,17 +79,21 @@ class Mixes(
     /**
      * [count] songs to queue next. [seed] is [SONG] ([id] in the library, or [artist] and [title] of a song elsewhere) or
      * [PICKS]. [exclude] is the queue, oldest first, as the apps key songs ("lib/<id>", "yt/<videoId>"): never again,
-     * and its last library songs steer, so a long radio follows what's playing. Throws [LibraryException] when Navidrome
-     * can't be asked.
+     * and its last library songs after the seed steer, so a long radio follows what's playing. Throws [LibraryException]
+     * when Navidrome can't be asked.
      */
     fun radio(user: String, login: Map<String, String>, seed: String, id: String?, artist: String?, title: String?, exclude: List<String>, count: Int): Radio {
         val started = System.currentTimeMillis()
         val deadline = started + BUILD_MS
-        val queued = exclude.takeLast(MAX_EXCLUDE).filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }
+        val recent = exclude.takeLast(MAX_EXCLUDE)
+        val queued = recent.filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }
         // The same request gets the same answer; the next batch (more queued) another one.
         val random = Random(listOf(user, seed, id, artist, title, queued.size, queued.lastOrNull()).hashCode())
         val index = library.artists(user, login)
-        val tail = queued.filter { it != id }.takeLast(3).map { start { library.song(login, it) } }.mapNotNull { it.await(deadline) }
+        // Only what was queued after the seed steers: the songs before it were played before the radio started.
+        val afterSeed = recent.drop(id?.let { recent.lastIndexOf("lib/$it") + 1 } ?: 0)
+        val tail = afterSeed.filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }.filter { it != id }.takeLast(3)
+            .map { start { library.song(login, it) } }.mapNotNull { it.await(deadline) }
         val radio = if (seed == PICKS) picksRadio(user, login, queued, tail, index, count, random, deadline)
         else songRadio(user, login, id, artist, title, queued, tail, index, count, random, deadline)
         println("Radio for $user (${radio.title}): ${radio.songs.size} songs" + (if (radio.more) "" else ", nothing more after them") +

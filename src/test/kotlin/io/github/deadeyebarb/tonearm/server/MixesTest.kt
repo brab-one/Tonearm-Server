@@ -184,6 +184,9 @@ class MixesTest {
     private fun Mixes.Radio.ids() = songs.map { it.id }
     private fun Mixes.Radio.artists() = songs.map { it.artist }
 
+    /** The ids Navidrome was asked [method] for. */
+    private fun asked(method: String) = synchronized(calls) { calls.filter { it.first == method }.map { it.second } }
+
     @Test
     fun aSongsRadioIsItsSimilarSongsAndLibraryArtistsLikeIt() {
         val radio = mixes().radio("alice", login, Mixes.SONG, "al1-2", null, null, listOf("yt/dQw4w9WgXcQ", "lib/al1-2"), 10)
@@ -221,6 +224,20 @@ class MixesTest {
             all = all + batch.ids().map { "lib/$it" }
         }
         assertEquals(all.distinct(), all)
+    }
+
+    @Test
+    fun onlyWhatWasQueuedAfterTheSeedSteers() {
+        val mixes = mixes()
+        // Radio from a song further down a playlist: the songs played before it don't steer.
+        val first = mixes.radio("alice", login, Mixes.SONG, "al1-2", null, null, listOf("lib/al5-1", "lib/al6-1", "lib/al7-1", "lib/al1-2"), 10)
+        assertEquals(listOf("al1-2"), asked("getSimilarSongs2"))
+        assertTrue(first.artists().all { it in setOf("The Oscillators", "Neon Cascade", "Signal Garden") }, first.artists().toString())
+        // The next batches follow what the radio queued after it.
+        synchronized(calls) { calls.clear() }
+        val queue = listOf("lib/al5-1", "lib/al1-2", "lib/al2-1", "lib/al2-2", "lib/al2-3", "lib/al8-1", "lib/al8-2")
+        mixes.radio("alice", login, Mixes.SONG, "al1-2", null, null, queue, 10)
+        assertEquals(setOf("al1-2", "al2-3", "al8-1", "al8-2"), asked("getSimilarSongs2").toSet())
     }
 
     @Test
