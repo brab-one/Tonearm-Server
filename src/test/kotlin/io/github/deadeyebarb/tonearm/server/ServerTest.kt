@@ -57,7 +57,7 @@ class ServerTest {
                 else if (ex.requestURI.path.endsWith("/tokenInfo.view")) """{"subsonic-response":{"status":"ok","tokenInfo":{"username":"Bob"}}}"""
                 else if (ex.requestURI.path.endsWith("/getUser.view") && getUserBroken) "<html>502 Bad Gateway</html>"
                 else if (ex.requestURI.path.endsWith("/getUser.view")) """{"subsonic-response":{"status":"ok","user":{"username":"${q["username"]}","adminRole":${q["username"]?.lowercase() == "alice"}}}}"""
-                else """{"subsonic-response":{"status":"ok"}}"""
+                else library(ex.requestURI.path.substringAfterLast('/').removeSuffix(".view"), q)
                 val bytes = body.encodeToByteArray()
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
@@ -93,6 +93,7 @@ class ServerTest {
             LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), requestsForEveryone = true),
             history = history,
             malojaImport = { user, admin -> if (admin) history.importMaloja(user, up, "maloja-secret", http) },
+            mixes = Mixes(LibraryReader("http://127.0.0.1:${navidrome.address.port}"), history, null, null, dataDir),
         ).start()
     }
 
@@ -101,6 +102,22 @@ class ServerTest {
         server.stop()
         navidrome.stop(0)
         upstream.stop(0)
+    }
+
+    /** Alice's library: one artist, one album of four songs, all like each other. */
+    private fun library(method: String, q: Map<String, String>): String {
+        fun song(n: Int) = """{"id":"s$n","title":"Song $n","artist":"The Oscillators","artistId":"ar1","album":"Tones","albumId":"al1","genre":"Electronic","year":2024,"size":${1000 + n},"replayGain":{"trackGain":-3.0}}"""
+        val songs = (1..4).joinToString(",") { song(it) }
+        val body = when (method) {
+            "getArtists" -> """"artists":{"index":[{"artist":[{"id":"ar1","name":"The Oscillators"}]}]}"""
+            "getArtist" -> """"artist":{"id":"ar1","name":"The Oscillators","album":[{"id":"al1","name":"Tones","genre":"Electronic"}]}"""
+            "getAlbum" -> """"album":{"id":"al1","song":[$songs]}"""
+            "getSong" -> """"song":${song(q["id"]?.removePrefix("s")?.toIntOrNull() ?: 1)}"""
+            "getSimilarSongs2" -> """"similarSongs2":{"song":[$songs]}"""
+            "getRandomSongs" -> """"randomSongs":{"song":[$songs]}"""
+            else -> return """{"subsonic-response":{"status":"ok"}}"""
+        }
+        return """{"subsonic-response":{"status":"ok",$body}}"""
     }
 
     private fun md5(text: String) = MessageDigest.getInstance("MD5").digest(text.encodeToByteArray()).joinToString("") { "%02x".format(it) }
@@ -423,6 +440,41 @@ class ServerTest {
         assertEquals(listOf("Sia", "Kongos"), listening.artists.map { it.artist }.sorted().reversed())
         assertEquals("Rewrite", listening.songs.first { it.artist == "Sia" }.album)
         assertEquals(null, history.importMaloja("alice", "http://127.0.0.1:${upstream.address.port}", null, http))
+    }
+
+    @Test
+    fun helloSaysWhatsNewInThisVersion() {
+        val hello = api("hello", alice())
+        for (flag in listOf("radio", "resume", "stats")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
+        // A server built without them (as tests do) says so too.
+        val bare = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test").start()
+        try {
+            val (_, text) = http.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:${bare.boundPort}/connect-tonearm/api/hello?apiKey=bobkey")).POST(HttpRequest.BodyPublishers.noBody()).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            ).let { it.statusCode() to it.body() }
+            assertEquals("false", Json.parseToJsonElement(text).jsonObject["radio"]!!.jsonPrimitive.content)
+        } finally {
+            bare.stop()
+        }
+    }
+
+    @Test
+    fun radioLeavesOutWhatsQueued() {
+        val (code, text) = call("/connect-tonearm/api/radio", alice() + listOf("seed" to "album"))
+        assertEquals(400, code)
+        assertEquals("seed has to be song or picks", Json.parseToJsonElement(text).jsonObject["error"]!!.jsonPrimitive.content)
+        assertEquals(400, call("/connect-tonearm/api/radio", alice() + listOf("seed" to "song", "artist" to "The Oscillators")).first)
+        assertEquals(400, call("/connect-tonearm/api/radio", alice() + listOf("seed" to "song", "id" to "s1"), "not json").first)
+        val radio = api("radio", alice(), listOf("seed" to "song", "id" to "s1", "count" to 5), """{"exclude":["yt/abc","lib/s1","lib/s3"]}""")
+        assertEquals("Radio · Song 1", radio["title"]!!.jsonPrimitive.content)
+        val songs = radio["songs"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(setOf("s2", "s4"), songs.map { it["id"]!!.jsonPrimitive.content }.toSet())
+        // Navidrome's song objects as they came, size and replay gain included.
+        assertEquals(1002, songs.first { it["id"]!!.jsonPrimitive.content == "s2" }["size"]!!.jsonPrimitive.int)
+        assertTrue("replayGain" in songs.first())
+        assertEquals("false", radio["more"]!!.jsonPrimitive.content)
+        assertTrue(radio["problem"] is kotlinx.serialization.json.JsonNull)
     }
 
     @Test

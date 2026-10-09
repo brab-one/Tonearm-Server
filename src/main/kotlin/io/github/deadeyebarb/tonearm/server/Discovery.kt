@@ -113,6 +113,11 @@ class Discovery(
         }
     }
 
+    /** The names of the artists Deezer relates to [name] (kept for a week, like the rest); empty when that fails. */
+    fun relatedArtists(name: String): List<String> = runCatching {
+        findArtist(name)?.let { related(it.long("id")) }.orEmpty().map { it.str("name") }.filter { it.isNotEmpty() }
+    }.getOrDefault(emptyList())
+
     /** Songs, albums and artists matching [query] on Deezer (answers kept for an hour). */
     fun search(query: String): WebSearch {
         val q = URLEncoder.encode(query, Charsets.UTF_8)

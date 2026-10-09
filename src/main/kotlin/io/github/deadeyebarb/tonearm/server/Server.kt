@@ -10,6 +10,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import java.io.File
 import java.net.InetAddress
@@ -38,6 +40,8 @@ class TonearmServer(
     private val malojaImport: ((user: String, admin: Boolean) -> Unit)? = null,
     /** Proxies whose word on who they forwarded a request for is taken (X-Forwarded-For, X-Real-IP). */
     private val trustedProxies: List<AddressRange> = AddressRange.LOCAL,
+    /** Radio, mixes from a sentence and daily mixes; none in tests that don't need them. */
+    private val mixes: Mixes? = null,
     /** Where each device left off, for Continue from the desktop. */
     private val handoffs: Handoffs = Handoffs(dataDir),
 ) {
@@ -122,6 +126,7 @@ class TonearmServer(
                 put("dislikes", true)
                 put("stats", true)
                 put("resume", true)
+                put("radio", mixes != null)
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
@@ -255,6 +260,28 @@ class TonearmServer(
                     user, since, limit("artists", 50), limit("songs", 0), limit("recent", 0),
                     to = to, albums = limit("albums", 0), before = query["before"]?.toLongOrNull(),
                 ))
+            }
+            "radio" -> {
+                val engine = mixes ?: return error(exchange, 404, "This Tonearm server has no radio")
+                val seed = query["seed"]
+                if (seed != Mixes.SONG && seed != Mixes.PICKS) return error(exchange, 400, "seed has to be song or picks")
+                fun param(name: String) = query[name]?.trim()?.take(300)?.ifEmpty { null }
+                val id = param("id")
+                val artist = param("artist")
+                val title = param("title")
+                if (seed == Mixes.SONG && id == null && (artist == null || title == null)) return error(exchange, 400, "seed=song needs id, or artist and title")
+                // The queue, oldest first, as the apps key songs.
+                val exclude = if (payload.isBlank()) emptyList() else try {
+                    (json.parseToJsonElement(payload).jsonObject["exclude"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                } catch (e: Exception) {
+                    return error(exchange, 400, "the body has to be {\"exclude\": [song keys]}")
+                }
+                val count = (query["count"]?.toIntOrNull() ?: 25).coerceIn(5, 50)
+                try {
+                    engine.toJson(engine.radio(user, NavidromeAuth.loginOf(query), seed, id, artist, title, exclude.takeLast(Mixes.MAX_EXCLUDE), count))
+                } catch (e: LibraryException) {
+                    return error(exchange, 502, "Couldn't read your library: ${e.message}")
+                }
             }
             "dismiss" -> {
                 val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")
