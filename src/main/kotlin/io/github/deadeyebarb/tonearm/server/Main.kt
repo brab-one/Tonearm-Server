@@ -13,7 +13,7 @@ import kotlin.system.exitProcess
  * all | admins, + PICKS_FOLDER for each user's weekly picks in a folder of their own), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
  * and AI_MODEL (+ AI_PULL, AI_CONTEXT for Ollama), or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
  * API (DISCOVERY=off turns that off). MALOJA_URL (+ MALOJA_API_KEY, MALOJA_USERS) only brings a Maloja's
- * history over, once. TRUSTED_PROXIES: the proxies whose X-Forwarded-For counts (loopback and Docker's networks).
+ * history over, once. TRUSTED_PROXIES: the proxies whose X-Forwarded-For counts (loopback, Docker's networks and the container's gateway).
  */
 fun main() {
     val navidrome = env("NAVIDROME_URL") ?: run {
@@ -44,8 +44,10 @@ fun main() {
     val discovery = if (env("DISCOVERY")?.lowercase() == "off") null else Discovery(navidrome, dataDir, history = history)
     val malojaImport = env("MALOJA_URL")?.let { url -> malojaImport(url, env("MALOJA_API_KEY"), env("MALOJA_USERS"), history) }
     val proxies = env("TRUSTED_PROXIES")
+    // A proxy on the same host connects from the gateway of this container's network.
+    val gateway = if (proxies == null) AddressRange.gateway() else null
     val trusted = when {
-        proxies == null -> AddressRange.LOCAL
+        proxies == null -> AddressRange.LOCAL + listOfNotNull(gateway?.hostAddress?.let(AddressRange::parse))
         proxies.equals("none", ignoreCase = true) -> emptyList()
         else -> try {
             AddressRange.parseList(proxies)
@@ -56,7 +58,7 @@ fun main() {
     }
     TonearmServer(port, basePath, NavidromeAuth(navidrome), dataDir, version, lidarr, recommendations, discovery, history, malojaImport, trusted).start()
     println("Tonearm server $version on port $port under ${"/" + basePath.trim('/')}, checking logins with Navidrome at $navidrome, data in $dataDir")
-    println("Proxies trusted to say who they forward for: " + (proxies ?: "127.0.0.0/8, ::1, 172.16.0.0/12 (Docker's networks)"))
+    println("Proxies trusted to say who they forward for: " + (proxies ?: ("127.0.0.0/8, ::1, 172.16.0.0/12 (Docker's networks)" + (gateway?.let { ", ${it.hostAddress} (this container's gateway)" } ?: ""))))
     println("Lidarr: " + (env("LIDARR_URL")?.let { "$it, " + if (lidarr!!.available(false)) "requests for everyone" else "admins only" } ?: "not set up"))
     env("PICKS_FOLDER")?.let { println("Weekly picks: each user's in their own folder in $it (as Lidarr sees it)" + if (lidarr == null) ", but there's no Lidarr" else "") }
     println("AI picks and search: " + (ai?.let { "${it.name.takeUnless { n -> n == "The AI" } ?: "OpenAI-style API"} with ${it.model}" } ?: "not set up (AI_PROVIDER)"))

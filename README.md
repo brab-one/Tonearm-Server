@@ -217,14 +217,18 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `OLLAMA_URL`, `OLLAMA_MODEL` | `qwen2.5` | The older way to say Ollama |
 | `MALOJA_URL`, `MALOJA_API_KEY`, `MALOJA_USERS` | | Only to bring a Maloja's history over once ([Moving off Maloja](#moving-off-maloja)) |
 | `DISCOVERY` | on | `off`: no discovery picks or similar artists (they ask Deezer) |
-| `TRUSTED_PROXIES` | `127.0.0.0/8, ::1, 172.16.0.0/12` | Proxies (addresses or blocks) whose word on who they forward for counts; `none` for no proxy. The default covers a proxy on the same host, which reaches the container through Docker's networks |
+| `TRUSTED_PROXIES` | `127.0.0.0/8, ::1, 172.16.0.0/12` and the container's gateway | Proxies (addresses or blocks) whose word on who they forward for counts; `none` for no proxy. The default covers a proxy on the same host, which reaches the container from its Docker network's gateway: in 172.16.0.0/12 at first, in a 192.168 block once Docker has used those up. With `network_mode: host` the gateway is your router, so set this then |
 | `JAVA_OPTS` | | e.g. `-Xmx512m` for more memory than the 256 MB the server takes at most |
 
 Every request except `/connect-tonearm/health` needs a valid Navidrome login. A user with 20 different failed
 logins from one address in 5 minutes is turned away there for a while; everyone else behind that address still
 gets in, and a device retrying an old password counts once. An address with 200 failed logins for anyone is
 turned away too. The address is the one the request came from, or the one a trusted proxy says it got it from (a
-proxy on another host has to be in `TRUSTED_PROXIES` for that). Lidarr's and the AI's keys never leave the server; what
+proxy on another host has to be in `TRUSTED_PROXIES` for that; the log says `Ignoring X-Forwarded-For from …` when a
+proxy isn't trusted, and everyone behind it then counts as one address). The compose file publishes port 8790 on
+IPv4 only: over IPv6, Docker passes connections on from the network's gateway, a trusted proxy, so anyone on your
+network could say they're someone else with each guess (with an older compose file, change its port line to
+`"0.0.0.0:8790:8790"`). Lidarr's and the AI's keys never leave the server; what
 non-admins may do in Lidarr is checked call by call (their requests go into one of Lidarr's root folders,
 without tags). AI picks are made in the background (a few minutes on a small GPU), kept for a week, and
 renewed when a user asks; discovery picks are kept for a day.

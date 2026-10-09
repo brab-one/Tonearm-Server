@@ -260,13 +260,23 @@ class TonearmServer(
         send(exchange, 200, response)
     }
 
+    /** Addresses that sent forwarding headers without being trusted, said in the log once. */
+    private val ignoredProxies = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     /**
      * Who's asking, for counting failed logins: the address the request came from or, when that's a trusted proxy, the
      * one the proxy got it from. Anyone else's forwarding headers are theirs to make up, so they don't count.
      */
     private fun clientOf(exchange: HttpExchange): String {
         val peer = exchange.remoteAddress.address
-        if (trustedProxies.none { it.contains(peer) }) return peer.hostAddress
+        if (trustedProxies.none { it.contains(peer) }) {
+            // Everyone behind a proxy that isn't trusted counts as one client: the log says so, once for each of the first few.
+            val header = listOf("X-Forwarded-For", "X-Real-IP").firstOrNull { exchange.requestHeaders.containsKey(it) }
+            if (header != null && ignoredProxies.size < 20 && ignoredProxies.add(peer.hostAddress)) {
+                println("Ignoring $header from ${peer.hostAddress}, which isn't a trusted proxy; if it's your proxy, add it to TRUSTED_PROXIES")
+            }
+            return peer.hostAddress
+        }
         // Each proxy adds the address it heard from at the end: the last one that isn't a trusted proxy is the client.
         val hops = exchange.requestHeaders["X-Forwarded-For"].orEmpty().flatMap { it.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
         val forwarded = hops.lastOrNull { hop -> AddressRange.literal(hop)?.let { a -> trustedProxies.none { it.contains(a) } } ?: true } ?: hops.firstOrNull()
@@ -345,6 +355,19 @@ class AddressRange private constructor(private val network: ByteArray, private v
             val bits = if ('/' in text) text.substringAfter('/').toIntOrNull()?.takeIf { it in 0..max } ?: return null else max
             return AddressRange(address.address, bits)
         }
+
+        /**
+         * The gateway of this container's network, from [routes] (/proc/net/route), or null. A proxy on the same host
+         * connects from there, also when Docker gave the network a block outside 172.16.0.0/12 (192.168.16.0/20, say).
+         */
+        fun gateway(routes: File = File("/proc/net/route")): InetAddress? = runCatching {
+            // Iface, Destination, Gateway, Flags, RefCnt, Use, Metric, Mask…: the default route goes everywhere through a gateway.
+            val route = routes.readLines().drop(1).map { it.trim().split(Regex("\\s+")) }
+                .firstOrNull { it.size > 7 && it[1] == "00000000" && it[7] == "00000000" && it[2] != "00000000" } ?: return null
+            // A number in the kernel's byte order: little-endian on amd64 and arm64.
+            val number = route[2].toLong(16)
+            InetAddress.getByAddress(ByteArray(4) { (number shr 8 * it).toByte() })
+        }.getOrNull()
 
         /** An IP address as written, or null; never a name, which would be looked up. */
         fun literal(text: String): InetAddress? {

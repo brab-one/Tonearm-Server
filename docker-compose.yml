@@ -14,7 +14,9 @@ services:
       # Has to match the custom location in Nginx Proxy Manager.
       BASE_PATH: /connect-tonearm
     ports:
-      - "8790:8790"
+      # IPv4 only: over IPv6, Docker passes connections on from this network's gateway, which the server trusts as
+      # a proxy, so anyone connecting that way could say they're someone else.
+      - "0.0.0.0:8790:8790"
     volumes:
       - tonearm-data:/data
 

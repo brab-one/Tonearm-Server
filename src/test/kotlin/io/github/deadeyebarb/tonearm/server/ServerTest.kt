@@ -249,6 +249,43 @@ class ServerTest {
     }
 
     @Test
+    fun theContainersGatewayIsReadFromItsRoutes() {
+        val routes = Files.createTempFile("route", "").toFile()
+        // A network Docker took from 192.168.0.0/16 once 172.17-31 were used up: 192.168.16.0/20, gateway 192.168.16.1.
+        routes.writeText(
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+                "eth0\t0010A8C0\t00000000\t0001\t0\t0\t0\t00F0FFFF\t0\t0\t0\n" +
+                "eth0\t00000000\t0110A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
+        )
+        assertEquals(java.net.InetAddress.getByName("192.168.16.1"), AddressRange.gateway(routes))
+        routes.writeText("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t0010A8C0\t00000000\t0001\t0\t0\t0\t00F0FFFF\t0\t0\t0\n")
+        assertEquals(null, AddressRange.gateway(routes))
+        routes.delete()
+        assertEquals(null, AddressRange.gateway(routes))
+    }
+
+    @Test
+    fun aProxyThatIsntTrustedShowsInTheLogOnce() {
+        val direct = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test", trustedProxies = emptyList()).start()
+        val log = java.io.ByteArrayOutputStream()
+        val console = System.out
+        System.setOut(java.io.PrintStream(log, true))
+        try {
+            repeat(2) {
+                http.send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:${direct.boundPort}/connect-tonearm/api/hello?u=alice&p=wonderland"))
+                        .header("X-Forwarded-For", "203.0.113.5").POST(HttpRequest.BodyPublishers.noBody()).build(),
+                    HttpResponse.BodyHandlers.ofString(),
+                )
+            }
+        } finally {
+            System.setOut(console)
+            direct.stop()
+        }
+        assertEquals(1, log.toString().lines().count { "Ignoring X-Forwarded-For from 127.0.0.1" in it && "TRUSTED_PROXIES" in it }, log.toString())
+    }
+
+    @Test
     fun anAdminIsntTakenForSomeoneElseWhenNavidromeHiccups() {
         val login = alice()
         getUserBroken = true
