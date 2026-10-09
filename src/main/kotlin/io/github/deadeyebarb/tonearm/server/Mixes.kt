@@ -22,6 +22,7 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
@@ -71,6 +72,8 @@ class Mixes(
     private val dir = File(dataDir, "mixes")
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val pool = Executors.newFixedThreadPool(4) { Thread(it, "mixes").apply { isDaemon = true } }
+    /** Radio's own, so a daily build or an AI mix never holds a radio up. */
+    private val radioPool = Executors.newFixedThreadPool(RADIO_THREADS) { Thread(it, "mixes-radio").apply { isDaemon = true } }
     private val aiWorker = Executors.newSingleThreadExecutor { Thread(it, "mixes-ai").apply { isDaemon = true } }
     private val dailyWorker = Executors.newSingleThreadExecutor { Thread(it, "mixes-daily").apply { isDaemon = true } }
 
@@ -84,7 +87,7 @@ class Mixes(
      */
     fun radio(user: String, login: Map<String, String>, seed: String, id: String?, artist: String?, title: String?, exclude: List<String>, count: Int): Radio {
         val started = System.currentTimeMillis()
-        val deadline = started + BUILD_MS
+        val deadline = started + RADIO_MS
         val recent = exclude.takeLast(MAX_EXCLUDE)
         val queued = recent.filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }
         // The same request gets the same answer; the next batch (more queued) another one.
@@ -93,7 +96,7 @@ class Mixes(
         // Only what was queued after the seed steers: the songs before it were played before the radio started.
         val afterSeed = recent.drop(id?.let { recent.lastIndexOf("lib/$it") + 1 } ?: 0)
         val tail = afterSeed.filter { it.startsWith("lib/") }.map { it.removePrefix("lib/") }.filter { it != id }.takeLast(3)
-            .map { start { library.song(login, it) } }.mapNotNull { it.await(deadline) }
+            .map { start(radioPool) { library.song(login, it) } }.mapNotNull { it.await(deadline) }
         val radio = if (seed == PICKS) picksRadio(user, login, queued, tail, index, count, random, deadline)
         else songRadio(user, login, id, artist, title, queued, tail, index, count, random, deadline)
         println("Radio for $user (${radio.title}): ${radio.songs.size} songs" + (if (radio.more) "" else ", nothing more after them") +
@@ -114,11 +117,11 @@ class Mixes(
         val artists = (listOfNotNull(seedArtist) + tail.reversed().mapNotNull { s -> s.artistId?.let { LibraryReader.ArtistRef(it, s.artist) } }).distinctBy { it.id }
         val names = (listOfNotNull(seed?.artist ?: artist) + tail.reversed().map { it.artist }).map(Played::mainArtist).distinctBy(Recommendations::loose)
 
-        val similar = seeds.take(4).map { s -> start { library.similarSongs(login, s.id, 50) } }
-        val sameArtist = artists.take(2).map { a -> start { library.songsOf(login, a.id, 3, random).shuffled(random) } }
+        val similar = seeds.take(4).map { s -> start(radioPool) { library.similarSongs(login, s.id, 50) } }
+        val sameArtist = artists.take(2).map { a -> start(radioPool) { library.songsOf(login, a.id, 3, random).shuffled(random) } }
         val genreSeed = seed ?: tail.lastOrNull()
-        val genre = genreSeed?.genre?.let { g -> start { library.random(login, g, genreSeed.year?.minus(7), genreSeed.year?.plus(7), 30) } }
-        val related = related(login, artists.take(4), names.take(4), index, random, deadline)
+        val genre = genreSeed?.genre?.let { g -> start(radioPool) { library.random(login, g, genreSeed.year?.minus(7), genreSeed.year?.plus(7), 30) } }
+        val related = related(login, artists.take(4), names.take(4), index, random, deadline, radioPool)
 
         val parts = listOf(
             Part(0.4, SongPicker.interleave(similar.map { it.await(deadline).orEmpty() })),
@@ -149,7 +152,7 @@ class Mixes(
         val (first, second) = if (hasPicks) picks.shuffled(random) to liked else {
             // Nothing picked or liked lately: what they liked any time, and the songs of the artists they played this month.
             val played = history.listening(user, now - LIKED_LATELY_MS, artists = 4, songs = 0, recent = 0).artists.mapNotNull { index[Recommendations.loose(it.artist)] }
-            val songs = played.map { a -> start { library.songsOf(login, a.id, 2, random).shuffled(random) } }
+            val songs = played.map { a -> start(radioPool) { library.songsOf(login, a.id, 2, random).shuffled(random) } }
             starred.map { it.first }.take(50) to SongPicker.interleave(songs.map { it.await(deadline).orEmpty() })
         }
         val counted = (first + second + tail).groupingBy { it.artistKey }.eachCount()
@@ -157,7 +160,7 @@ class Mixes(
         // No part of its own for the artists of the picks and likes: the ones like each other are related ones too.
         val related = related(
             login, seeds.mapNotNull { s -> s.artistId?.let { LibraryReader.ArtistRef(it, s.artist) } }, seeds.map { Played.mainArtist(it.artist) }, index, random, deadline,
-            ownLast = true,
+            radioPool, ownLast = true,
         )
         // The first batch of a picks radio starts with the picks.
         val lead = if (hasPicks && picks.none { it.id in queued }) 8 else 0
@@ -175,24 +178,26 @@ class Mixes(
      * Songs of library artists like [artists] (Navidrome's similar artists) and [names] (Deezer's related ones that the
      * library has), the ones more of them point to first, each artist's songs taking turns. [artists] and [names] are
      * left out (their songs are a part of their own), unless [ownLast]: then the ones another of them points to come
-     * after all the others, so likes that are all like each other still go on with their artists' other songs.
+     * after all the others, so likes that are all like each other still go on with their artists' other songs. Asks
+     * [on]; finding the artists takes two thirds of the time left at most, so there's time for their songs.
      */
     private fun related(
         login: Map<String, String>, artists: List<LibraryReader.ArtistRef>, names: List<String>,
-        index: Map<String, LibraryReader.ArtistRef>, random: Random, deadline: Long, ownLast: Boolean = false,
+        index: Map<String, LibraryReader.ArtistRef>, random: Random, deadline: Long, on: ExecutorService, ownLast: Boolean = false,
     ): List<LibrarySong> {
-        val fromNavidrome = artists.map { a -> start { library.similarArtists(login, a.id) } }
-        val fromDeezer = discovery?.let { d -> names.map { n -> start { d.relatedArtists(n).mapNotNull { index[Recommendations.loose(it)] } } } }.orEmpty()
+        val fromNavidrome = artists.map { a -> start(on) { library.similarArtists(login, a.id) } }
+        val fromDeezer = discovery?.let { d -> names.map { n -> start(on) { d.relatedArtists(n).mapNotNull { index[Recommendations.loose(it)] } } } }.orEmpty()
         val own = (artists.map { Recommendations.loose(it.name) } + names.map(Recommendations::loose)).toSet()
+        val artistsBy = deadline - (deadline - System.currentTimeMillis()).coerceAtLeast(0) / 3
         val score = LinkedHashMap<String, Pair<LibraryReader.ArtistRef, Double>>()
         for (future in fromNavidrome + fromDeezer) {
-            future.await(deadline).orEmpty().forEachIndexed { i, ref ->
+            future.await(artistsBy).orEmpty().forEachIndexed { i, ref ->
                 val key = Recommendations.loose(ref.name)
                 if (ownLast || key !in own) score[key] = ref to (score[key]?.second ?: 0.0) + 1.0 - i / 40.0
             }
         }
         val chosen = score.entries.sortedByDescending { it.value.second }.sortedBy { it.key in own }.take(RELATED).map { it.value.first }
-        val songs = chosen.map { a -> start { library.songsOf(login, a.id, 2, random).shuffled(random) } }
+        val songs = chosen.map { a -> start(on) { library.songsOf(login, a.id, 2, random).shuffled(random) } }
         return SongPicker.interleave(songs.map { it.await(deadline).orEmpty() })
     }
 
@@ -395,7 +400,10 @@ class Mixes(
         val index = library.artists(user, login)
         val starredArtists = library.starred(login).second
         val plays = top.associate { Recommendations.loose(it.artist) to it.plays }
-        val ranked = (top.map { it.artist } + starredArtists).mapNotNull { index[Recommendations.loose(it)] }.distinctBy { it.id }
+        // The artists played most, then some they liked, so a build asks Navidrome about a hundred artists at most.
+        val played = top.mapNotNull { index[Recommendations.loose(it.artist)] }.distinctBy { it.id }
+        val liked = starredArtists.mapNotNull { index[Recommendations.loose(it)] }.distinctBy { it.id }.filter { a -> played.none { it.id == a.id } }
+        val ranked = played + liked.take(LIKED_ARTISTS)
         // Each artist's main genre: the one most of their albums have.
         var deadline = System.currentTimeMillis() + BUILD_MS
         val genreOf = ranked.map { a -> a to start { library.albumsOf(login, a.id) } }.associate { (a, future) ->
@@ -419,7 +427,7 @@ class Mixes(
             val random = Random((user + day + n).hashCode())
             // Each artist's songs, the ones played most first.
             val own = members.map { a -> start { library.songsOf(login, a.id, 3, random).shuffled(random).sortedByDescending { heard[it.key] ?: 0 } } }
-            val related = related(login, members, members.map { it.name }, index, random, deadline)
+            val related = related(login, members, members.map { it.name }, index, random, deadline, pool)
             val parts = listOf(Part(0.6, SongPicker.interleave(own.map { it.await(deadline).orEmpty() })), Part(0.4, related))
             val picked = SongPicker.pick(parts, MIX_SIZE, base.copy(excludeIds = base.excludeIds + used), random, perArtist = 6)
             if (picked.songs.isEmpty()) continue
@@ -478,7 +486,7 @@ class Mixes(
         )
     }
 
-    private fun <T> start(task: () -> T): Future<T> = pool.submit(Callable(task))
+    private fun <T> start(on: ExecutorService = pool, task: () -> T): Future<T> = on.submit(Callable(task))
 
     /** The answer, or null when it failed or isn't there by [deadline] (it's given up on then). */
     private fun <T> Future<T>.await(deadline: Long): T? = try {
@@ -499,6 +507,10 @@ class Mixes(
         const val MAX_EXCLUDE = 500
         /** How long a list waits for Navidrome (and Deezer) before it goes with what it has. */
         private const val BUILD_MS = 15_000L
+        /** A radio's wait: well under the apps' 8 s, so what it found still gets to them. */
+        private const val RADIO_MS = 6_000L
+        /** All of one radio's lookups at once: 4 for similar songs, 3 for its artists' own and the genre, 8 for related artists. */
+        private const val RADIO_THREADS = 16
         private const val DAY_MS = 24 * 3_600_000L
         /** Radio and AI mixes leave out what was played this long ago or since. */
         private const val RADIO_PLAYED_MS = 6 * 3_600_000L
@@ -513,6 +525,8 @@ class Mixes(
         private const val FAILED_MIX_MS = 30_000L
         private const val RETRY_DAILY_MS = 5 * 60_000L
         private const val MAX_DAILY = 3
+        /** Liked artists a daily build takes on top of the 60 played most. */
+        private const val LIKED_ARTISTS = 40
         /** Artists per daily mix when they go by rank. */
         private const val CHUNK = 6
         private const val NOTHING_LIKE_IT = "Nothing like that in your library"

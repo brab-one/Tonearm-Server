@@ -64,6 +64,8 @@ class MixesTest {
     private var aiFails = false
     private var aiGate: CountDownLatch? = null
     private var aiCalls = 0
+    /** How long Navidrome's agents (similar songs and artists, Last.fm say) take to answer. */
+    private var agentsMs = 0L
     private var now = ZonedDateTime.of(2026, 10, 9, 12, 0, 0, 0, VIENNA).toInstant().toEpochMilli()
     private val login = mapOf("u" to "alice", "p" to "wonderland")
 
@@ -110,6 +112,7 @@ class MixesTest {
                 val q = ex.requestURI.rawQuery.split('&').associate { URLDecoder.decode(it.substringBefore('='), Charsets.UTF_8) to URLDecoder.decode(it.substringAfter('='), Charsets.UTF_8) }
                 val method = ex.requestURI.path.substringAfterLast('/').removeSuffix(".view")
                 synchronized(calls) { calls += method to (q["id"] ?: q["query"] ?: q["genre"]) }
+                if (method == "getSimilarSongs2" || method == "getArtistInfo2") Thread.sleep(agentsMs)
                 if (q["u"] != "alice" || q["p"] != "wonderland") return@createContext answer(ex, """{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}""")
                 val notFound = """{"subsonic-response":{"status":"failed","error":{"code":70,"message":"Not found"}}}"""
                 val body = when (method) {
@@ -238,6 +241,16 @@ class MixesTest {
         val queue = listOf("lib/al5-1", "lib/al1-2", "lib/al2-1", "lib/al2-2", "lib/al2-3", "lib/al8-1", "lib/al8-2")
         mixes.radio("alice", login, Mixes.SONG, "al1-2", null, null, queue, 10)
         assertEquals(setOf("al1-2", "al2-3", "al8-1", "al8-2"), asked("getSimilarSongs2").toSet())
+    }
+
+    @Test
+    fun slowAgentsStillLeaveTimeForTheRelatedArtistsSongs() {
+        agentsMs = 10_000
+        val started = System.currentTimeMillis()
+        val radio = mixes().radio("alice", login, Mixes.SONG, "al1-2", null, null, listOf("lib/al1-2"), 10)
+        // Within the apps' 8 s, with Deezer's related artist although Navidrome's similar songs and artists never came.
+        assertTrue(System.currentTimeMillis() - started < 8_000, "${System.currentTimeMillis() - started} ms")
+        assertTrue("Signal Garden" in radio.artists(), radio.artists().toString())
     }
 
     @Test
