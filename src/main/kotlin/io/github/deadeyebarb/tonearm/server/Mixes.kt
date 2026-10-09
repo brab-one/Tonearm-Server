@@ -331,7 +331,8 @@ class Mixes(
             Part(0.35, SongPicker.interleave(byArtist.map { it.await(deadline).orEmpty() })),
             Part(0.25, SongPicker.interleave(byGenre.map { it.await(deadline).orEmpty() })),
         )
-        val picked = SongPicker.pick(parts, MIX_SIZE, rules(user, playedWithinMs = RADIO_PLAYED_MS), random, perArtist = 4)
+        // What they played lately only fills what the rest can't, so a small library still makes a mix.
+        val picked = SongPicker.pick(parts, MIX_SIZE, rules(user, playedLaterMs = MIX_PLAYED_MS), random, perArtist = 4)
         val shown = if (prompt.length > 40) prompt.take(40).trimEnd() + "…" else prompt
         println("AI mix for $user (\"$shown\"): ${found.size} of ${named.size} songs found, ${artists.size} artists, ${genreNames.size} genres, ${(System.currentTimeMillis() - started) / 1000} s")
         val title = (reply["title"] as? JsonPrimitive)?.contentOrNull?.trim()?.take(80)?.ifEmpty { null } ?: prompt
@@ -425,7 +426,8 @@ class Mixes(
 
         val previous = loadDaily(user)?.mixes.orEmpty().flatMap { m -> m.songs.map { LibrarySong(it).id } }.toSet()
         val heard = history.since(user, now - 90 * DAY_MS).filter { it.counts }.groupingBy { SongKey.of(it.artist, it.title) }.eachCount()
-        val base = rules(user, previous, DAILY_PLAYED_MS)
+        // Yesterday's songs and the last days' plays only fill what the rest can't, so a small library still has mixes.
+        val base = rules(user, later = previous, playedLaterMs = DAILY_PLAYED_MS)
         val used = HashSet<String>()
         val mixes = ArrayList<StoredMix>()
         for ((n, group) in groups.withIndex()) {
@@ -479,14 +481,22 @@ class Mixes(
 
     // --- Shared ------------------------------------------------------------------------------------------------
 
-    /** What the user's lists leave out: [exclude] (ids), disliked songs and said-no-to's, and what they played in the last [playedWithinMs]. */
-    private fun rules(user: String, exclude: Set<String> = emptySet(), playedWithinMs: Long = 0, avoid: Set<String> = emptySet()): Rules {
+    /**
+     * What the user's lists leave out: [exclude] (ids), disliked songs and said-no-to's, and what they played in the last
+     * [playedWithinMs]. [later] (ids) and what they played in the last [playedLaterMs] only fill what nothing else can.
+     */
+    private fun rules(
+        user: String, exclude: Set<String> = emptySet(), playedWithinMs: Long = 0, avoid: Set<String> = emptySet(),
+        later: Set<String> = emptySet(), playedLaterMs: Long = 0,
+    ): Rules {
         val disliked = history.dislikedSongs(user)
         val dismissed = history.dismissed(user)
-        val lately = if (playedWithinMs > 0) history.since(user, clock() - playedWithinMs).map { SongKey.of(it.artist, it.title) } else emptyList()
+        fun playedWithin(ms: Long) = if (ms > 0) history.since(user, clock() - ms).map { SongKey.of(it.artist, it.title) }.toSet() else emptySet()
         return Rules(
             excludeIds = exclude,
-            avoidKeys = disliked.map { SongKey.of(it.artist, it.title) }.toSet() + lately + avoid,
+            avoidKeys = disliked.map { SongKey.of(it.artist, it.title) }.toSet() + playedWithin(playedWithinMs) + avoid,
+            laterIds = later,
+            laterKeys = playedWithin(playedLaterMs),
             dismissedArtists = dismissed.filter { it.album == null }.map { Recommendations.loose(it.artist) }.toSet(),
             dismissedAlbums = dismissed.mapNotNull { d -> d.album?.let { Recommendations.loose(d.artist) + "|" + Recommendations.looseTitle(it) } }.toSet(),
             dislikedArtistCount = disliked.groupingBy { Recommendations.loose(Played.mainArtist(it.artist)) }.eachCount(),
@@ -519,8 +529,11 @@ class Mixes(
         /** All of one radio's lookups at once: 4 for similar songs, 3 for its artists' own and the genre, 8 for related artists. */
         private const val RADIO_THREADS = 16
         private const val DAY_MS = 24 * 3_600_000L
-        /** Radio and AI mixes leave out what was played this long ago or since. */
+        /** Radio leaves out what was played this long ago or since. */
         private const val RADIO_PLAYED_MS = 6 * 3_600_000L
+        /** A mix from a sentence takes what was played this long ago or since only when nothing else is left. */
+        private const val MIX_PLAYED_MS = 6 * 3_600_000L
+        /** Daily mixes take what was played this long ago or since (and yesterday's songs) only when nothing else is left. */
         private const val DAILY_PLAYED_MS = 3 * DAY_MS
         private const val LIKED_LATELY_MS = 30 * DAY_MS
         /** Related artists a list takes songs from. */

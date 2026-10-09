@@ -380,6 +380,15 @@ class MixesTest {
 
     private fun Mixes.DailyMixes.ids() = mixes.flatMap { m -> m.songs.map { it.id } }
 
+    /** Whether each mix has [held] only after all its other songs. */
+    private fun Mixes.DailyMixes.heldLast(held: Set<String>) = mixes.all { m -> m.songs.map { it.id }.dropWhile { it !in held }.all { it in held } }
+
+    /** Plays of every song by [artists] (all of them when empty), [ago] before now. */
+    private fun playedAll(ago: Long, vararg artists: String) {
+        val songs = allSongs().map { it["artist"]!!.jsonPrimitive.content to it["title"]!!.jsonPrimitive.content }.filter { artists.isEmpty() || it.first in artists }
+        history.add("alice", songs.map { (artist, title) -> Played(now - ago, artist, title, durationMs = 200_000, listenedMs = 200_000) })
+    }
+
     @Test
     fun dailyMixesAreMadeOnceADayByGenreFamily() {
         listen()
@@ -391,11 +400,11 @@ class MixesTest {
         assertEquals(listOf("Daily Mix 1", "Daily Mix 2", "Daily Mix 3"), daily.mixes.map { it.title })
         assertEquals("daily-2026-10-09-1", daily.mixes.first().id)
         assertTrue(daily.mixes.first().subtitle!!.endsWith(" and more"))
-        // Electronic, ambient and jazz each make one; nothing twice, nothing played in the last three days.
+        // Electronic, ambient and jazz each make one; nothing twice, what was played in the last three days only last.
         val families = daily.mixes.map { m -> m.songs.map { Mixes.family(it.genre!!) }.groupingBy { it }.eachCount().maxBy { it.value }.key }
         assertEquals(setOf("electronic", "ambient", "jazz"), families.toSet())
         assertEquals(daily.ids().distinct(), daily.ids())
-        assertFalse("al1-1" in daily.ids())
+        assertTrue(daily.heldLast(setOf("al1-1")))
         // Asked again the same day: the same, without asking Navidrome.
         synchronized(calls) { calls.clear() }
         assertEquals(daily.ids(), mixes.daily("alice", login, VIENNA).ids())
@@ -408,15 +417,15 @@ class MixesTest {
         listen()
         val mixes = mixes()
         val yesterday = mixes.ready()
-        // 03:59 the next morning is still that day; 04:01 is the next one, made without yesterday's songs.
+        // 03:59 the next morning is still that day; 04:01 is the next one, with yesterday's songs only after the new ones.
         now = ZonedDateTime.of(2026, 10, 10, 3, 59, 0, 0, VIENNA).toInstant().toEpochMilli()
         assertEquals(yesterday.ids(), mixes.daily("alice", login, VIENNA).ids())
         now = ZonedDateTime.of(2026, 10, 10, 4, 1, 0, 0, VIENNA).toInstant().toEpochMilli()
         assertTrue(mixes.daily("alice", login, VIENNA).running)
         val today = mixes.ready()
         assertEquals("2026-10-10", today.day)
-        assertTrue(today.ids().isNotEmpty())
-        assertTrue(today.ids().none { it in yesterday.ids() }, "${yesterday.ids()} then ${today.ids()}")
+        assertTrue(today.ids().any { it !in yesterday.ids() }, "${yesterday.ids()} then ${today.ids()}")
+        assertTrue(today.heldLast(yesterday.ids().toSet() + "al1-1"), "${yesterday.ids()} then ${today.ids()}")
         // In UTC it's 02:01, so still the 9th there: a device in UTC gets the 10th's, and they're not made again.
         assertEquals("2026-10-09", Mixes.dayOf(now, ZoneId.of("UTC")))
         synchronized(calls) { calls.clear() }
@@ -439,6 +448,19 @@ class MixesTest {
         assertFalse(again.running)
         assertEquals(daily.ids() - gone.id, again.ids())
         assertTrue(synchronized(calls) { calls.isEmpty() })
+    }
+
+    @Test
+    fun aSmallLibraryPlayedThroughStillHasDailyMixes() {
+        listen()
+        // Every song played in the last day: they make the mixes rather than none, dislikes still left out.
+        playedAll(3_600_000)
+        history.dislike("alice", "Signal Garden", "Shimmer", null, on = true)
+        val daily = mixes().ready()
+        assertNull(daily.problem)
+        assertEquals(3, daily.mixes.size)
+        assertFalse("al3-2" in daily.ids())
+        assertEquals(daily.ids().distinct(), daily.ids())
     }
 
     @Test
@@ -508,6 +530,27 @@ class MixesTest {
         assertTrue(mixes.mix("alice", login, "low ambient tones", refresh = true).running)
         mixes.made("low ambient tones")
         assertEquals(calls + 1, aiCalls)
+    }
+
+    @Test
+    fun songsPlayedLatelyFillAMixAfterTheOthers() {
+        // After a while of listening to a small library: all but Kosmische Drift played in the last hours.
+        playedAll(3_600_000, "The Oscillators", "Signal Garden", "Neon Cascade", "Midnight Quartet", "Brush Trio")
+        history.dislike("alice", "Signal Garden", "Shimmer", null, on = true)
+        val mix = mixes().made("low ambient tones")
+        assertNull(mix.problem)
+        // Kosmische Drift's songs (of the AI's genre) first, then the AI's song and artist although they were played, never a dislike.
+        assertEquals(setOf("Kosmische Drift"), mix.songs.take(3).map { it.artist }.toSet())
+        assertEquals("Low Hum", mix.songs[3].title)
+        assertEquals(setOf("al3-1", "al3-3"), mix.songs.drop(4).map { it.id }.toSet())
+    }
+
+    @Test
+    fun anAnswerTheLibraryHasNothingOfIsSaid() {
+        aiAnswer = """{"title":"Polka Night","songs":[{"artist":"Nobody","title":"Made Up"}],"artists":["Nobody"],"genres":["Polka"]}"""
+        val mix = mixes().made("polka night")
+        assertTrue(mix.songs.isEmpty())
+        assertEquals("Nothing in your library fits that", mix.problem)
     }
 
     @Test

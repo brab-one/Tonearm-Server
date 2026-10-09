@@ -69,6 +69,21 @@ class SongPickerTest {
     }
 
     @Test
+    fun songsHeldBackOnlyFillWhatNothingElseCan() {
+        val parts = listOf(Part(0.5, songs(2, "Air", "Bjork")), Part(0.5, songs(2, "Cocteau Twins")))
+        val rules = Rules(excludeIds = setOf("A2"), laterIds = setOf("A1", "B1"), laterKeys = setOf(SongKey.of("Cocteau Twins", "Song C1")))
+        // Enough others: they stay out.
+        val few = pick(parts, count = 2, rules = rules)
+        assertEquals(setOf("B2", "C2"), few.songs.map { it.id }.toSet())
+        assertTrue(few.more)
+        // Not enough: they come after all the others, and what's left out stays out.
+        val all = pick(parts, count = 6, rules = rules)
+        assertEquals(setOf("B2", "C2"), all.songs.take(2).map { it.id }.toSet())
+        assertEquals(setOf("A1", "B1", "C1"), all.songs.drop(2).map { it.id }.toSet())
+        assertFalse(all.more)
+    }
+
+    @Test
     fun theSameSeedGivesTheSameList() {
         val parts = listOf(Part(0.6, songs(4, "Air", "Bjork", "Cocteau Twins")), Part(0.4, songs(4, "Doves", "Elbow", "Feist")))
         assertEquals(pick(parts, seed = 7).songs, pick(parts, seed = 7).songs)

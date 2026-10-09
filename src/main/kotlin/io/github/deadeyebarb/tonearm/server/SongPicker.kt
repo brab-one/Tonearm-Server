@@ -10,12 +10,16 @@ import kotlin.random.Random
  */
 class Part(val share: Double, val candidates: List<LibrarySong>, val lead: Int = 0, val inOrder: Boolean = false)
 
-/** What a list leaves out and leans away from, for one user right now. */
+/** What a list leaves out, holds back and leans away from, for one user right now. */
 data class Rules(
-    /** Song ids: what's queued already, the seed, yesterday's mix. */
+    /** Song ids: what's queued already, the seed, today's other mixes. */
     val excludeIds: Set<String> = emptySet(),
-    /** [SongKey]s: disliked songs, and what was played lately. */
+    /** [SongKey]s: disliked songs, and for radio what was played lately. */
     val avoidKeys: Set<String> = emptySet(),
+    /** Song ids that only fill places nothing else can: yesterday's mix. */
+    val laterIds: Set<String> = emptySet(),
+    /** [SongKey]s that only fill places nothing else can: for the mixes, what was played lately. */
+    val laterKeys: Set<String> = emptySet(),
     /** [Recommendations.loose] artists said no to. */
     val dismissedArtists: Set<String> = emptySet(),
     /** Albums said no to: loose artist + "|" + [Recommendations.looseTitle]. */
@@ -25,6 +29,9 @@ data class Rules(
 ) {
     fun allows(song: LibrarySong): Boolean = song.id !in excludeIds && song.key !in avoidKeys && song.artistKey !in dismissedArtists &&
         song.album?.let { song.artistKey + "|" + Recommendations.looseTitle(it) } !in dismissedAlbums
+
+    /** Whether [song] only fills places nothing else can. */
+    fun later(song: LibrarySong): Boolean = song.id in laterIds || song.key in laterKeys
 }
 
 /**
@@ -37,52 +44,66 @@ object SongPicker {
     /**
      * [count] songs from [parts]: what [rules] leave out and songs already in an earlier part go first, then each part
      * fills its share by draws that favour its first candidates; a part that runs short hands its places to the others.
-     * At most [perArtist] songs per artist, and no artist twice within [gap] places (counting [before], the artists just
-     * ahead of the list) when there's a choice. [Picked.more] says whether anything is left for another list.
+     * Places none of them can fill go to what [Rules.later] holds back, a song from each part in turn, after all the
+     * others. At most [perArtist] songs per artist, and no artist twice within [gap] places (counting [before], the
+     * artists just ahead of the list) when there's a choice. [Picked.more] says whether anything is left for another list.
      */
     fun pick(parts: List<Part>, count: Int, rules: Rules, random: Random, perArtist: Int = 2, gap: Int = 3, before: List<String> = emptyList()): Picked {
         val ids = HashSet<String>()
         val keys = HashSet<String>()
-        val pools = parts.map { part ->
-            part.candidates.filter { song -> rules.allows(song) && song.id !in ids && song.key !in keys && ids.add(song.id) && keys.add(song.key) }.toMutableList()
+        val allowed = parts.map { part ->
+            part.candidates.filter { song -> rules.allows(song) && song.id !in ids && song.key !in keys && ids.add(song.id) && keys.add(song.key) }
         }
-        // Earlier candidates weigh more; each disliked song of an artist makes the artist's others less likely.
-        val weights = pools.map { pool ->
-            pool.mapIndexed { i, song -> (1.0 - i.toDouble() / (pool.size + 5)).pow(2) * 0.75.pow(rules.dislikedArtistCount[song.artistKey] ?: 0) }.toMutableList()
-        }
+        val pools = allowed.map { songs -> Pool(songs.filterNot(rules::later), rules) }
+        val held = allowed.map { songs -> Pool(songs.filter(rules::later), rules) }
         val perArtistCount = HashMap<String, Int>()
         val picked = parts.map { mutableListOf<LibrarySong>() }
+        val filled = parts.map { mutableListOf<LibrarySong>() }
 
-        fun draw(p: Int): Boolean {
-            val pool = pools[p]
-            val fits = pool.indices.filter { (perArtistCount[pool[it].artistKey] ?: 0) < perArtist }
+        fun draw(p: Int, from: List<Pool>, into: List<MutableList<LibrarySong>>): Boolean {
+            val pool = from[p]
+            val fits = pool.songs.indices.filter { (perArtistCount[pool.songs[it].artistKey] ?: 0) < perArtist }
             if (fits.isEmpty()) return false
             val chosen = if (parts[p].inOrder) fits.first() else {
-                var left = random.nextDouble() * fits.sumOf { weights[p][it] }
-                fits.firstOrNull { i -> left -= weights[p][i]; left < 0 } ?: fits.last()
+                var left = random.nextDouble() * fits.sumOf { pool.weights[it] }
+                fits.firstOrNull { i -> left -= pool.weights[i]; left < 0 } ?: fits.last()
             }
-            val song = pool.removeAt(chosen)
-            weights[p].removeAt(chosen)
+            val song = pool.songs.removeAt(chosen)
+            pool.weights.removeAt(chosen)
             perArtistCount.merge(song.artistKey, 1, Int::plus)
-            picked[p] += song
+            into[p] += song
             return true
         }
 
         var short = 0
-        quotas(parts.map { it.share }, count).forEachIndexed { p, quota -> repeat(quota) { if (!draw(p)) short++ } }
-        // What a part couldn't fill goes to the others, a song each in turn.
-        while (short > 0) {
-            var drew = false
-            for (p in parts.indices) if (short > 0 && draw(p)) {
-                short--
-                drew = true
+        quotas(parts.map { it.share }, count).forEachIndexed { p, quota -> repeat(quota) { if (!draw(p, pools, picked)) short++ } }
+        // What a part couldn't fill goes to the others, a song each in turn, and then to the songs held back.
+        for ((from, into) in listOf(pools to picked, held to filled)) {
+            while (short > 0) {
+                var drew = false
+                for (p in parts.indices) if (short > 0 && draw(p, from, into)) {
+                    short--
+                    drew = true
+                }
+                if (!drew) break
             }
-            if (!drew) break
         }
-        val lead = parts.indices.flatMap { p -> picked[p].take(parts[p].lead) }
-        val rest = interleave(parts.indices.map { p -> picked[p].drop(parts[p].lead) })
-        val first = spread(lead, gap, before)
-        return Picked(first + spread(rest, gap, before + first.map { it.artistKey }), pools.any { it.isNotEmpty() })
+        // The parts' leads, then the rest taking turns; the same again for the songs held back.
+        fun ordered(drawn: List<List<LibrarySong>>, ahead: List<String>): List<LibrarySong> {
+            val lead = spread(parts.indices.flatMap { p -> drawn[p].take(parts[p].lead) }, gap, ahead)
+            return lead + spread(interleave(parts.indices.map { p -> drawn[p].drop(parts[p].lead) }), gap, ahead + lead.map { it.artistKey })
+        }
+        val first = ordered(picked, before)
+        return Picked(first + ordered(filled, before + first.map { it.artistKey }), (pools + held).any { it.songs.isNotEmpty() })
+    }
+
+    /** A part's candidates still to draw from, and how likely each is. */
+    private class Pool(candidates: List<LibrarySong>, rules: Rules) {
+        val songs = candidates.toMutableList()
+        // Earlier candidates weigh more; each disliked song of an artist makes the artist's others less likely.
+        val weights = candidates.mapIndexed { i, song ->
+            (1.0 - i.toDouble() / (candidates.size + 5)).pow(2) * 0.75.pow(rules.dislikedArtistCount[song.artistKey] ?: 0)
+        }.toMutableList()
     }
 
     /** [count] places shared out by [shares] (largest remainders get the places left over). */

@@ -36,14 +36,14 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   shortcut and the desktop's Picks radio use it; the last songs queued after the one it started from (the apps say
   which one that is) steer the next batch, so a long radio follows what's playing.
 - **Mixes from a sentence**, with an AI: "rainy sunday, mellow jazz" becomes a mix of 30 songs from your
-  library: the songs the AI names that the library has first, then its artists and genres. Each one is kept for
-  the day (Ask again makes a new one), one at a time per user. Without an AI the apps match the words in the
-  library themselves.
+  library: the songs the AI names that the library has first, then its artists and genres, nothing disliked, and
+  what you played in the last 6 hours only when there isn't enough else. Each one is kept for the day (Ask again
+  makes a new one), one at a time per user. Without an AI the apps match the words in the library themselves.
 - **Daily mixes**: up to three mixes of 30 songs a day for each user, from the artists they played in the last
-  90 days and liked, grouped by genre (electronic, jazz, metal…) with library artists like them; nothing from
-  yesterday's mixes or the last three days' plays, nothing disliked. The first time an app asks on a new day they're
-  made (a few seconds); a day starts at 04:00 in the app's time zone, and an app where it's still the day before
-  gets the new day's mixes.
+  90 days and liked, grouped by genre (electronic, jazz, metal…) with library artists like them; nothing disliked,
+  and yesterday's songs and the last three days' plays only when there isn't enough else. The first time an app
+  asks on a new day they're made (a few seconds); a day starts at 04:00 in the app's time zone, and an app where
+  it's still the day before gets the new day's mixes.
 - **Continue where you left off**: the server keeps each user's last song, place and queue from their devices,
   also after the desktop quits or the server restarts, so the phone in the car can carry on where the desktop
   stopped.
