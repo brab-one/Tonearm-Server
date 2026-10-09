@@ -290,6 +290,176 @@ class MixesTest {
         assertTrue(runCatching { down.radio("alice", login, Mixes.SONG, "al1-2", null, null, emptyList(), 10) }.exceptionOrNull() is LibraryException)
     }
 
+    // --- Daily mixes ---
+
+    /** Plays over the last few weeks: two artists of each of three genre families, and one song the day before. */
+    private fun listen(user: String = "alice", artists: Int = 6) {
+        val songs = listOf("al1-2", "al4-1", "al3-2", "al7-1", "al5-1", "al6-1").take(artists)
+        history.add(user, songs.withIndex().flatMap { (i, id) ->
+            val s = song(id)
+            (1..2).map { n -> Played(now - (10 + 10 * i) * DAY - n * 3_600_000L, s["artist"]!!.jsonPrimitive.content, s["title"]!!.jsonPrimitive.content, durationMs = 200_000, listenedMs = 200_000) }
+        } + Played(now - DAY, "The Oscillators", "Low Hum", durationMs = 200_000, listenedMs = 200_000))
+    }
+
+    private fun Mixes.ready(zone: ZoneId = VIENNA, user: String = "alice"): Mixes.DailyMixes {
+        var daily = daily(user, login, zone)
+        val until = System.currentTimeMillis() + 10_000
+        while (daily.running && System.currentTimeMillis() < until) {
+            Thread.sleep(20)
+            daily = daily(user, login, zone)
+        }
+        return daily
+    }
+
+    private fun Mixes.DailyMixes.ids() = mixes.flatMap { m -> m.songs.map { it.id } }
+
+    @Test
+    fun dailyMixesAreMadeOnceADayByGenreFamily() {
+        listen()
+        val mixes = mixes()
+        assertTrue(mixes.daily("alice", login, VIENNA).running)
+        val daily = mixes.ready()
+        assertEquals("2026-10-09", daily.day)
+        assertNull(daily.problem)
+        assertEquals(listOf("Daily Mix 1", "Daily Mix 2", "Daily Mix 3"), daily.mixes.map { it.title })
+        assertEquals("daily-2026-10-09-1", daily.mixes.first().id)
+        assertTrue(daily.mixes.first().subtitle!!.endsWith(" and more"))
+        // Electronic, ambient and jazz each make one; nothing twice, nothing played in the last three days.
+        val families = daily.mixes.map { m -> m.songs.map { Mixes.family(it.genre!!) }.groupingBy { it }.eachCount().maxBy { it.value }.key }
+        assertEquals(setOf("electronic", "ambient", "jazz"), families.toSet())
+        assertEquals(daily.ids().distinct(), daily.ids())
+        assertFalse("al1-1" in daily.ids())
+        // Asked again the same day: the same, without asking Navidrome.
+        synchronized(calls) { calls.clear() }
+        assertEquals(daily.ids(), mixes.daily("alice", login, VIENNA).ids())
+        assertTrue(synchronized(calls) { calls.isEmpty() })
+        assertTrue(File(dir, "mixes/alice.daily.json").exists())
+    }
+
+    @Test
+    fun aDayStartsAtFourInTheirZone() {
+        listen()
+        val mixes = mixes()
+        val yesterday = mixes.ready()
+        // 03:59 the next morning is still that day; 04:01 is the next one, made without yesterday's songs.
+        now = ZonedDateTime.of(2026, 10, 10, 3, 59, 0, 0, VIENNA).toInstant().toEpochMilli()
+        assertEquals(yesterday.ids(), mixes.daily("alice", login, VIENNA).ids())
+        now = ZonedDateTime.of(2026, 10, 10, 4, 1, 0, 0, VIENNA).toInstant().toEpochMilli()
+        assertTrue(mixes.daily("alice", login, VIENNA).running)
+        val today = mixes.ready()
+        assertEquals("2026-10-10", today.day)
+        assertTrue(today.ids().isNotEmpty())
+        assertTrue(today.ids().none { it in yesterday.ids() }, "${yesterday.ids()} then ${today.ids()}")
+        // In UTC it's 02:01, so still the 9th there.
+        assertEquals("2026-10-09", Mixes.dayOf(now, ZoneId.of("UTC")))
+        assertEquals("2026-10-09", mixes.ready(ZoneId.of("UTC")).day)
+    }
+
+    @Test
+    fun aDislikeAfterTheyWereMadeIsLeftOutAndARestartReadsThemBack() {
+        listen()
+        val daily = mixes().ready()
+        val gone = daily.mixes.first().songs.first()
+        history.dislike("alice", gone.artist, gone.title, null, on = true)
+        synchronized(calls) { calls.clear() }
+        val again = mixes().daily("alice", login, VIENNA)
+        assertFalse(again.running)
+        assertEquals(daily.ids() - gone.id, again.ids())
+        assertTrue(synchronized(calls) { calls.isEmpty() })
+    }
+
+    @Test
+    fun dailyMixesThatCantBeSavedStillShowWithWhy() {
+        listen()
+        val other = Files.createTempDirectory("tonearm-mixes").toFile()
+        File(other, "mixes").writeText("not a folder")
+        val daily = mixes(other).ready()
+        assertEquals(3, daily.mixes.size)
+        assertTrue(daily.problem!!.startsWith("Can't save in"), daily.problem)
+    }
+
+    @Test
+    fun tooLittleHistoryMakesNoDailyMixes() {
+        listen(artists = 2)
+        val daily = mixes().ready()
+        assertTrue(daily.mixes.isEmpty())
+        assertEquals("Play some music and your daily mixes show up tomorrow", daily.problem)
+    }
+
+    @Test
+    fun genresFallIntoFamilies() {
+        assertEquals("electronic", Mixes.family("Synthpop"))
+        assertEquals("electronic", Mixes.family("Trip-Hop"))
+        assertEquals("hip hop", Mixes.family("Hip-Hop"))
+        assertEquals("jazz", Mixes.family("Acid Jazz"))
+        assertEquals("metal", Mixes.family("Death Metal"))
+        assertEquals("punk", Mixes.family("Punk Rock"))
+        assertEquals("soul/r&b", Mixes.family("Contemporary R&B"))
+        assertEquals("folk/country", Mixes.family("Singer-Songwriter"))
+        assertEquals("indie", Mixes.family("Indie"))
+    }
+
+    // --- Mixes from a sentence ---
+
+    private fun Mixes.made(prompt: String, refresh: Boolean = false): Mixes.Mix {
+        var mix = mix("alice", login, prompt, refresh)
+        val until = System.currentTimeMillis() + 10_000
+        while (mix.running && System.currentTimeMillis() < until) {
+            Thread.sleep(20)
+            mix = mix("alice", login, prompt, false)
+        }
+        return mix
+    }
+
+    @Test
+    fun theAisSongsComeFirstAndTheLibraryFillsTheRest() {
+        val mixes = mixes()
+        val started = mixes.mix("alice", login, "low ambient tones", refresh = false)
+        assertTrue(started.running)
+        assertEquals("", started.title)
+        val mix = mixes.made("low ambient tones")
+        assertEquals("Low Tones", mix.title)
+        assertEquals("Ollama fake", mix.ai)
+        assertEquals("Low Hum", mix.songs.first().title)
+        assertTrue(mix.songs.none { it.title == "Made Up" })
+        // The artist it chose, and its genre from another artist.
+        assertTrue("Signal Garden" in mix.songs.map { it.artist })
+        assertTrue("Kosmische Drift" in mix.songs.map { it.artist })
+        assertTrue(mix.id.startsWith("mix-"))
+        assertTrue("Make a playlist" in File(dir, "mixes/alice.mix-prompt.txt").readText())
+        // Kept: asked again, the AI isn't.
+        val calls = aiCalls
+        assertEquals(mix.songs, mixes.mix("alice", login, "Low ambient tones!", refresh = false).songs)
+        assertEquals(calls, aiCalls)
+        // Asking again does.
+        assertTrue(mixes.mix("alice", login, "low ambient tones", refresh = true).running)
+        mixes.made("low ambient tones")
+        assertEquals(calls + 1, aiCalls)
+    }
+
+    @Test
+    fun anAiThatFailsGivesAProblemAndNoSongs() {
+        aiFails = true
+        val mix = mixes().made("low ambient tones")
+        assertTrue(mix.songs.isEmpty())
+        assertTrue(mix.problem!!.startsWith("The AI couldn't answer"), mix.problem)
+        assertFalse(mix.running)
+    }
+
+    @Test
+    fun oneMixAtATime() {
+        val gate = CountDownLatch(1)
+        aiGate = gate
+        val mixes = mixes()
+        assertTrue(mixes.mix("alice", login, "low ambient tones", refresh = false).running)
+        val other = mixes.mix("alice", login, "mellow jazz", refresh = false)
+        assertFalse(other.running)
+        assertEquals("Still making “low ambient tones”; one mix at a time", other.problem)
+        gate.countDown()
+        assertEquals("Low Tones", mixes.made("low ambient tones").title)
+        assertTrue(mixes.mix("alice", login, "mellow jazz", refresh = false).running)
+    }
+
     companion object {
         private val VIENNA = ZoneId.of("Europe/Vienna")
         private const val DAY = 24 * 3_600_000L

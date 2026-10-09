@@ -142,7 +142,7 @@ class Recommendations(
     private val model get() = ai.model
 
     /** Which AI answers, for the apps ("Claude claude-opus-5-5"). */
-    val label: String get() = (if (ai.name == "The AI") "" else ai.name + " ") + ai.model
+    val label: String get() = ai.label
 
     private val dir = File(dataDir, "recommendations").apply { mkdirs() }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }

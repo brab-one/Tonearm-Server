@@ -445,7 +445,10 @@ class ServerTest {
     @Test
     fun helloSaysWhatsNewInThisVersion() {
         val hello = api("hello", alice())
-        for (flag in listOf("radio", "resume", "stats")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
+        for (flag in listOf("radio", "dailyMixes", "resume", "stats")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
+        // Mixes from a sentence need an AI, and this server has none.
+        assertEquals("false", hello["mix"]!!.jsonPrimitive.content)
+        assertEquals(404, call("/connect-tonearm/api/mix", alice() + listOf("prompt" to "mellow jazz")).first)
         // A server built without them (as tests do) says so too.
         val bare = TonearmServer(0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test").start()
         try {
@@ -475,6 +478,13 @@ class ServerTest {
         assertTrue("replayGain" in songs.first())
         assertEquals("false", radio["more"]!!.jsonPrimitive.content)
         assertTrue(radio["problem"] is kotlinx.serialization.json.JsonNull)
+    }
+
+    @Test
+    fun dailyMixesNeedARealTimeZone() {
+        assertEquals(400, call("/connect-tonearm/api/dailymixes", alice() + listOf("tz" to "Mars/Olympus")).first)
+        val daily = api("dailymixes", alice(), listOf("tz" to "Europe/Vienna"))
+        assertTrue("day" in daily && "mixes" in daily)
     }
 
     @Test

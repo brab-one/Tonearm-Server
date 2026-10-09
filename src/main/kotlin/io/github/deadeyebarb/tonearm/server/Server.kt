@@ -17,6 +17,7 @@ import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.URLDecoder
+import java.time.ZoneId
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -127,6 +128,8 @@ class TonearmServer(
                 put("stats", true)
                 put("resume", true)
                 put("radio", mixes != null)
+                put("mix", mixes?.hasAi == true)
+                put("dailyMixes", mixes != null)
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
@@ -282,6 +285,17 @@ class TonearmServer(
                 } catch (e: LibraryException) {
                     return error(exchange, 502, "Couldn't read your library: ${e.message}")
                 }
+            }
+            "mix" -> {
+                val engine = mixes?.takeIf { it.hasAi } ?: return error(exchange, 404, "This Tonearm server has no AI set up")
+                val prompt = query["prompt"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "prompt is required")
+                engine.toJson(engine.mix(user, NavidromeAuth.loginOf(query), prompt, refresh = query["refresh"] == "true"))
+            }
+            "dailymixes" -> {
+                val engine = mixes ?: return error(exchange, 404, "This Tonearm server has no daily mixes")
+                val tz = query["tz"]?.trim()?.takeIf { it.isNotEmpty() }
+                val zone = if (tz == null) ZoneId.systemDefault() else runCatching { ZoneId.of(tz) }.getOrNull() ?: return error(exchange, 400, "tz isn't a time zone")
+                engine.toJson(engine.daily(user, NavidromeAuth.loginOf(query), zone))
             }
             "dismiss" -> {
                 val artist = query["artist"]?.trim()?.take(300)?.takeIf { it.isNotEmpty() } ?: return error(exchange, 400, "artist is required")

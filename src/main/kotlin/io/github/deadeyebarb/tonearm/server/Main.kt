@@ -8,12 +8,13 @@ import kotlin.system.exitProcess
 
 /**
  * The Tonearm server: Tonearm Connect for every user of a Navidrome server, Lidarr without handing out its key,
- * listening history, picks and radio. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
+ * listening history, picks, radio and mixes. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
  * /connect-tonearm), PORT (8790), DATA_DIR (/data); optional LIDARR_URL + LIDARR_API_KEY (+ LIDARR_REQUESTS =
  * all | admins, + PICKS_FOLDER for each user's weekly picks in a folder of their own), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
  * and AI_MODEL (+ AI_PULL, AI_CONTEXT for Ollama), or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
  * API (DISCOVERY=off turns that off). MALOJA_URL (+ MALOJA_API_KEY, MALOJA_USERS) only brings a Maloja's
- * history over, once. TRUSTED_PROXIES: the proxies whose X-Forwarded-For counts (loopback and Docker's networks).
+ * history over, once. TRUSTED_PROXIES: the proxies whose X-Forwarded-For counts (loopback and Docker's networks). TZ: the
+ * time zone daily mixes go by when an app doesn't send its own.
  */
 fun main() {
     val navidrome = env("NAVIDROME_URL") ?: run {
@@ -65,7 +66,7 @@ fun main() {
     env("PICKS_FOLDER")?.let { println("Weekly picks: each user's in their own folder in $it (as Lidarr sees it)" + if (lidarr == null) ", but there's no Lidarr" else "") }
     println("AI picks and search: " + (ai?.let { "${it.name.takeUnless { n -> n == "The AI" } ?: "OpenAI-style API"} with ${it.model}" } ?: "not set up (AI_PROVIDER)"))
     println("Discovery and similar artists: " + if (discovery != null) "from Deezer" else "off")
-    println("Radio: from the library")
+    println("Radio and daily mixes: from the library; " + (ai?.let { "AI mixes with ${it.label}" } ?: "AI mixes: off (no AI)"))
     if (malojaImport != null) println("Maloja: its history comes over for the first of ${env("MALOJA_USERS") ?: "Navidrome's admins"} to use the apps, unless it did before")
     // Everything it keeps lives there; without it Connect still works, but nothing is remembered.
     DataFiles.unwritable(dataDir)?.let { System.err.println("WARNING: $it") } ?: println("Data: $dataDir is writable")
