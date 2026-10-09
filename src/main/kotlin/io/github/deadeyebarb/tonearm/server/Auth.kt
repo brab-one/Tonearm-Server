@@ -12,6 +12,7 @@ import java.net.http.HttpResponse
 import java.security.MessageDigest
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Who is calling: the apps send their usual Subsonic login (u + t/s, u + p, or apiKey) and this asks
@@ -28,6 +29,8 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
      * different login last failed, so a device retrying an old password counts once instead of as many guesses.
      */
     private val failures = ConcurrentHashMap<String, MutableMap<String, Long>>()
+    /** When [failures] were last gone through for the ones that are over. */
+    private val lastSweep = AtomicLong(0)
 
     sealed interface Result {
         data class Ok(val user: String, val admin: Boolean = false) : Result
@@ -89,8 +92,10 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
 
     private fun failed(key: String, login: String, now: Long) {
         failures.compute(key) { _, logins -> (logins ?: HashMap()).apply { put(login, now) } }
-        // Addresses that stopped trying are let go of now and then, so the map can't keep growing.
-        if (failures.size > MAX_TRACKED) failures.keys.forEach { recentFailures(it, now) }
+        // Addresses that stopped trying are let go of now and then, so the map can't keep growing. Not on every failure:
+        // with many still trying, going through them all each time would keep everyone's logins waiting.
+        val last = lastSweep.get()
+        if (failures.size > MAX_TRACKED && now - last > SWEEP_MS && lastSweep.compareAndSet(last, now)) failures.keys.forEach { recentFailures(it, now) }
     }
 
     private class Unreachable(message: String) : Exception(message)
@@ -121,5 +126,7 @@ class NavidromeAuth(navidromeUrl: String, private val http: HttpClient = HttpCli
         /** Different failed logins from one address, whoever for: trying one user after another. */
         private const val MAX_CLIENT_FAILURES = 200
         private const val MAX_TRACKED = 10_000
+        /** How often at most the failures are gone through once there are more than [MAX_TRACKED]. */
+        private const val SWEEP_MS = 30_000L
     }
 }
