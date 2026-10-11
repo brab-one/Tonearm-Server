@@ -90,7 +90,7 @@ class ServerTest {
         history = History(dataDir)
         server = TonearmServer(
             0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test",
-            LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), requestsForEveryone = true),
+            LidarrProxy(Upstream("Lidarr", up, "X-Api-Key", "lidarr-secret"), Requests(dataDir), requestsForEveryone = true),
             history = history,
             malojaImport = { user, admin -> if (admin) history.importMaloja(user, up, "maloja-secret", http) },
             mixes = Mixes(LibraryReader("http://127.0.0.1:${navidrome.address.port}"), history, null, null, dataDir),
@@ -493,7 +493,7 @@ class ServerTest {
     @Test
     fun helloSaysWhatsNewInThisVersion() {
         val hello = api("hello", alice())
-        for (flag in listOf("radio", "dailyMixes", "resume", "stats")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
+        for (flag in listOf("radio", "dailyMixes", "resume", "stats", "ownRequests")) assertEquals("true", hello[flag]!!.jsonPrimitive.content, flag)
         // Mixes from a sentence need an AI, and this server has none.
         assertEquals("false", hello["mix"]!!.jsonPrimitive.content)
         assertEquals(404, call("/connect-tonearm/api/mix", alice() + listOf("prompt" to "mellow jazz")).first)

@@ -1,26 +1,39 @@
 package io.github.deadeyebarb.tonearm.server
 
+import kotlinx.serialization.DeserializationStrategy
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.descriptors.element
+import kotlinx.serialization.encoding.CompositeDecoder
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.decodeStructure
+import kotlinx.serialization.json.DecodeSequenceMode
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.decodeToSequence
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.io.IOException
 import java.io.InputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.util.BitSet
 
 /** Plain API paths only: no "." or ".." segments that the upstream would resolve elsewhere. */
 fun validPath(pattern: Regex, path: String) = pattern.matches(path) && path.split('/').none { segment -> segment.all { it == '.' } }
@@ -74,6 +87,25 @@ class Upstream(
         null
     }
 
+    /**
+     * A GET's answer: what [parse] made of a 200 as it came in, so a long one is never held whole, or else the answer as
+     * it was (an error, say). One that can't be read the way [parse] expects, or doesn't come at all, is a 502.
+     */
+    fun <T> fetch(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), parse: (InputStream) -> T): Fetched<T> = try {
+        val response = http.send(request(call, extraQuery, ByteArray(0)), HttpResponse.BodyHandlers.ofInputStream())
+        val type = response.headers().firstValue("Content-Type").orElse(null)
+        response.body().use { body ->
+            if (response.statusCode() == 200) Fetched(parse(body), ProxyAnswer(200, type, ByteArray(0)))
+            else Fetched(null, ProxyAnswer(response.statusCode(), type, body.readAllBytes()))
+        }
+    } catch (e: IllegalArgumentException) {
+        Fetched(null, error(502, "$name's answer wasn't what was asked for"))
+    } catch (e: Exception) {
+        Fetched(null, error(502, "Can't reach $name: ${e.message ?: e.javaClass.simpleName}"))
+    }
+
+    class Fetched<T>(val value: T?, val answer: ProxyAnswer)
+
     private fun request(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body): HttpRequest {
         val query = (keptQuery(call.rawQuery) + extraQuery.map { (k, v) -> k + "=" + java.net.URLEncoder.encode(v, Charsets.UTF_8) })
             .joinToString("&")
@@ -106,14 +138,21 @@ data class PicksFolder(val path: String, val ready: Boolean, val problem: String
 
 /**
  * Lidarr for everyone on Navidrome. Admins get all of it (Brainarr, weekly picks, removing music).
- * Everyone else can look things up, see what's downloading or wanted, and request artists and albums,
+ * Everyone else can look things up, see what they asked for downloading or wanted, and request artists and albums,
  * which land in one of Lidarr's own root folders with no tags; nothing gets deleted or reconfigured.
+ * Who asked for what is kept in [requests]: admins see it on what's downloading and wanted.
  * With [picksRoot] (PICKS_FOLDER), each user has a folder of their own in it for their weekly picks, which
  * only they can add to and delete from (and which has its own Navidrome library, so only they see it).
  */
-class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone: Boolean, private val picksRoot: String? = null) {
+class LidarrProxy(
+    private val lidarr: Upstream,
+    private val requests: Requests,
+    private val requestsForEveryone: Boolean,
+    private val picksRoot: String? = null,
+) {
     private val json = Json { ignoreUnknownKeys = true }
     @Volatile private var roots: Pair<Set<String>, Long>? = null
+    @Volatile private var homes: Homes? = null
 
     fun available(admin: Boolean) = admin || requestsForEveryone
 
@@ -126,9 +165,8 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
         val command = if (call.method == "POST" && endpoint == "command") parseCommand(call.body) ?: return badBody() else null
         // Someone's weekly picks are theirs alone, also for admins: nothing anyone asks for goes into their folder.
         intoOthersPicks(call, endpoint, user, monitor, command)?.let { return it }
-        if (admin) return lidarr.send(call, body = monitor?.body() ?: call.body)
-        val body = when (call.method) {
-            "GET" -> if (READ.any { it.matches(endpoint) }) call.body else return denied()
+        if (call.method == "GET") return read(call, endpoint, admin, user)
+        val body = if (admin) monitor?.body() ?: call.body else when (call.method) {
             "POST" -> when (endpoint) {
                 "artist" -> artistRequest(call.body, user) ?: return badRoot()
                 "album" -> albumRequest(call.body, user) ?: return badRoot()
@@ -141,7 +179,246 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
             "DELETE" -> return if (inOwnPicks(endpoint, user)) lidarr.send(call.copy(rawQuery = deleteQuery(call.rawQuery)), body = ByteArray(0)) else denied()
             else -> return denied()
         }
-        return lidarr.send(call, body = body)
+        if (call.method == "POST" && endpoint == "album") wantedAgain(body, user)?.let { return it }
+        val answer = lidarr.send(call, body = body)
+        if (answer.status in 200..299) note(user, asked(call.method, endpoint, body, answer.body, monitor, command))
+        return answer
+    }
+
+    /**
+     * A look into Lidarr. Everyone but admins sees only what they asked for (or what's in their own picks folder) in the
+     * queue and the wanted lists. Admins see everything, and on what's downloading or wanted who asked for it ("requestedBy").
+     */
+    private fun read(call: ProxyCall, endpoint: String, admin: Boolean, user: String): ProxyAnswer {
+        if (!admin && READ.none { it.matches(endpoint) }) return denied()
+        if (endpoint in PAGED || endpoint == "queue/details") {
+            val album = endpoint.startsWith("wanted/")
+            val askers = Askers(if (admin) requests.everyone() else mapOf(user to requests.of(user)))
+            fun who(record: JsonObject) = askers.of(record, album)
+            if (admin) {
+                val shown = { record: JsonObject ->
+                    val by = who(record)
+                    if (by.isEmpty()) record else JsonObject(record + ("requestedBy" to JsonArray(by.map(::JsonPrimitive))))
+                }
+                return if (endpoint == "queue/details") list(call, shown = shown) else paged(call, all = true, shown = shown)
+            }
+            val theirs = { record: JsonObject -> who(record).isNotEmpty() || inOwnFolder(record, user) }
+            return if (endpoint == "queue/details") list(call, theirs) else paged(call, all = false, keep = theirs)
+        }
+        return lidarr.send(call)
+    }
+
+    /**
+     * Who asked for a queue item's or ([album]) a wanted album's album or artist, by Lidarr's ids and the metadata's (when
+     * its album and artist come with it).
+     */
+    private fun Askers.of(record: JsonObject, album: Boolean): List<String> {
+        val albumOf = if (album) record else record["album"] as? JsonObject
+        val artist = record["artist"] as? JsonObject
+        return of(
+            albumId = if (album) record.int("id") else record.int("albumId") ?: albumOf?.int("id"),
+            foreignAlbumId = albumOf?.string("foreignAlbumId"),
+            artistId = record.int("artistId") ?: artist?.int("id"),
+            foreignArtistId = artist?.string("foreignArtistId"),
+        )
+    }
+
+    /**
+     * A page of Lidarr's queue or wanted list as the app asked for it (page, pageSize, sorting), with only the records
+     * [keep] lets through, each as [shown] makes it, and totalRecords counting just those. Lidarr is read [CHUNK] records
+     * at a time, a record at a time as they come in, and only the page asked for is kept, so a long list is never held
+     * whole. With [all], nothing is left out: Lidarr's own count holds, and only the records up to the end of the page are read.
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    private fun paged(call: ProxyCall, all: Boolean, keep: (JsonObject) -> Boolean = { true }, shown: (JsonObject) -> JsonObject = { it }): ProxyAnswer {
+        val query = call.rawQuery.orEmpty().split('&').filter { it.isNotEmpty() }
+        fun name(part: String) = java.net.URLDecoder.decode(part.substringBefore('='), Charsets.UTF_8).lowercase()
+        fun number(key: String) = query.firstOrNull { name(it) == key }?.substringAfter('=', "")?.toIntOrNull()
+        val page = (number("page") ?: 1).coerceAtLeast(1)
+        val size = (number("pagesize") ?: DEFAULT_PAGE).coerceIn(1, MAX_PAGE)
+        val from = (page - 1).toLong() * size
+        val rest = call.copy(rawQuery = query.filterNot { name(it) == "page" || name(it) == "pagesize" }.joinToString("&"))
+        // With everything kept, the page starts in the chunk that holds its first record.
+        var chunk = if (all) (from / CHUNK).toInt() + 1 else 1
+        var index = if (all) (chunk - 1).toLong() * CHUNK else 0L
+        var first: LidarrPage? = null
+        val kept = ArrayList<String>()
+        while (true) {
+            val reader = PageReader { record ->
+                if (keep(record)) {
+                    if (index >= from && index < from + size) kept += shown(record).toString()
+                    index++
+                }
+            }
+            val fetched = lidarr.fetch(rest, listOf("page" to "$chunk", "pageSize" to "$CHUNK")) { json.decodeFromStream(reader, it) }
+            val part = fetched.value ?: return fetched.answer
+            if (first == null) first = part
+            // Fewer than asked for is the end; more is a Lidarr that sent everything at once (one that doesn't page).
+            val end = part.records != CHUNK || chunk.toLong() * CHUNK >= part.totalRecords || chunk >= MAX_CHUNKS
+            if (end || all && index >= from + size) break
+            chunk++
+        }
+        val head = buildJsonObject {
+            put("page", page)
+            put("pageSize", size)
+            first.sortKey?.let { put("sortKey", it) }
+            first.sortDirection?.let { put("sortDirection", it) }
+            put("totalRecords", if (all) first.totalRecords else index)
+        }.toString()
+        return ProxyAnswer(200, "application/json", (head.dropLast(1) + ",\"records\":[" + kept.joinToString(",") + "]}").encodeToByteArray())
+    }
+
+    /** A page of Lidarr's queue or wanted list as it answered, with how many [records] it had. */
+    private class LidarrPage(val sortKey: String?, val sortDirection: String?, val totalRecords: Long, val records: Int)
+
+    /** Reads a page of Lidarr's queue or wanted list as it comes in, handing each record to [each] and letting go of it. */
+    private class PageReader(private val each: (JsonObject) -> Unit) : DeserializationStrategy<LidarrPage> {
+        override val descriptor = buildClassSerialDescriptor("LidarrPage") {
+            element<JsonElement>("sortKey")
+            element<JsonElement>("sortDirection")
+            element<Long>("totalRecords")
+            element("records", ListSerializer(JsonObject.serializer()).descriptor)
+        }
+
+        override fun deserialize(decoder: Decoder): LidarrPage = decoder.decodeStructure(descriptor) {
+            var sortKey: String? = null
+            var sortDirection: String? = null
+            var total = 0L
+            var records = 0
+            while (true) {
+                when (val i = decodeElementIndex(descriptor)) {
+                    0 -> sortKey = (decodeSerializableElement(descriptor, i, JsonElement.serializer()) as? JsonPrimitive)?.contentOrNull
+                    1 -> sortDirection = (decodeSerializableElement(descriptor, i, JsonElement.serializer()) as? JsonPrimitive)?.contentOrNull
+                    2 -> total = decodeLongElement(descriptor, i)
+                    3 -> records = decodeSerializableElement(descriptor, i, EachRecord(each))
+                    CompositeDecoder.DECODE_DONE -> break
+                    else -> throw SerializationException("Unexpected element $i")
+                }
+            }
+            LidarrPage(sortKey, sortDirection, total, records)
+        }
+    }
+
+    /** A list of records, each handed to [each] as it's read; what comes of it is how many there were. */
+    private class EachRecord(private val each: (JsonObject) -> Unit) : DeserializationStrategy<Int> {
+        override val descriptor = ListSerializer(JsonObject.serializer()).descriptor
+
+        override fun deserialize(decoder: Decoder): Int = decoder.decodeStructure(descriptor) {
+            var count = 0
+            while (true) {
+                val i = decodeElementIndex(descriptor)
+                if (i == CompositeDecoder.DECODE_DONE) break
+                each(decodeSerializableElement(descriptor, i, JsonObject.serializer()))
+                count++
+            }
+            count
+        }
+    }
+
+    /** Lidarr's list answer with only what [keep] lets through, each as [shown] makes it, read and written an item at a time. */
+    @OptIn(ExperimentalSerializationApi::class)
+    private fun list(call: ProxyCall, keep: (JsonObject) -> Boolean = { true }, shown: (JsonObject) -> JsonObject = { it }): ProxyAnswer {
+        val fetched = lidarr.fetch(call) { input ->
+            val out = java.io.ByteArrayOutputStream()
+            out.write('['.code)
+            var first = true
+            for (item in json.decodeToSequence(input, JsonObject.serializer(), DecodeSequenceMode.ARRAY_WRAPPED)) {
+                if (!keep(item)) continue
+                if (!first) out.write(','.code)
+                first = false
+                out.write(shown(item).toString().encodeToByteArray())
+            }
+            out.write(']'.code)
+            out.toByteArray()
+        }
+        return fetched.value?.let { ProxyAnswer(200, "application/json", it) } ?: fetched.answer
+    }
+
+    /** Where Lidarr keeps its artists, as far as picks folders go: every artist's id, and the path of those in one. */
+    private class Homes(val at: Long, val known: BitSet, val picks: Map<Int, String>)
+
+    /**
+     * Where Lidarr's artists live as of the last minute, read as Lidarr's list of artists comes in, never whole. What was
+     * known before when Lidarr can't be asked, null when nothing.
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    private fun homes(): Homes? {
+        val known = homes
+        val now = System.currentTimeMillis()
+        if (known != null && now - known.at < HOMES_MS) return known
+        val root = picksRoot ?: return null
+        val artists = lidarr.read("api/v1/artist") { json.decodeFromStream(ARTIST_HOMES, it) } ?: return known
+        val ids = BitSet().apply { artists.forEach { if (it.id > 0) set(it.id) } }
+        val picks = artists.filter { a -> a.path?.let { isUnder(it, root) } == true }.associate { it.id to it.path!! }
+        return Homes(now, ids, picks).also { homes = it }
+    }
+
+    /** Whether a queue item or wanted album is in [user]'s own picks folder. */
+    private fun inOwnFolder(record: JsonObject, user: String): Boolean {
+        val own = picksFolder(user) ?: return false
+        val path = (record["artist"] as? JsonObject)?.string("path") ?: record.int("artistId")?.let { homes()?.picks?.get(it) } ?: return false
+        return isUnder(path, own)
+    }
+
+    /**
+     * What a request that went through asked for: an artist (unless it's added with nothing wanted) with the albums it
+     * names, an album, or albums or an artist to monitor or search for.
+     */
+    private fun asked(method: String, endpoint: String, sent: ByteArray, answer: ByteArray, monitor: Monitor?, command: Command?): List<Requested> {
+        val now = System.currentTimeMillis()
+        return when {
+            method == "POST" && endpoint == "artist" -> {
+                val artist = jsonObject(sent) ?: return emptyList()
+                val added = jsonObject(answer)
+                val options = artist.field("addOptions") as? JsonObject
+                val whole = options?.text("monitor")?.equals("none", ignoreCase = true) != true
+                val albums = (options?.field("albumsToMonitor") as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                listOfNotNull(Requested(now, artistId = added?.int("id"), foreignArtistId = added?.string("foreignArtistId") ?: artist.text("foreignArtistId")).takeIf { whole }) +
+                    albums.map { Requested(now, foreignAlbumId = it) }
+            }
+            method == "POST" && endpoint == "album" -> {
+                val added = jsonObject(answer)
+                listOf(Requested(now, albumId = added?.int("id"), foreignAlbumId = added?.string("foreignAlbumId") ?: jsonObject(sent)?.text("foreignAlbumId")))
+            }
+            monitor != null -> if (monitor.monitored) monitor.albumIds.map { Requested(now, albumId = it) } else emptyList()
+            command != null && command.name.equals("AlbumSearch", ignoreCase = true) -> command.albumIds.map { Requested(now, albumId = it) }
+            command != null && command.name.equals("ArtistSearch", ignoreCase = true) -> listOfNotNull(command.artistId?.let { Requested(now, artistId = it) })
+            else -> emptyList()
+        }.filter { it.isAlbum || it.artistId != null || it.foreignArtistId != null }
+    }
+
+    /** Notes [asked] as [user]'s request. When that can't be saved the request went through all the same, and the log says so. */
+    private fun note(user: String, asked: List<Requested>) {
+        if (user.isEmpty() || asked.isEmpty()) return
+        // What was added may be new to Lidarr, in someone's picks folder too.
+        homes = null
+        try {
+            requests.add(user, asked)
+        } catch (e: IOException) {
+            System.err.println("Couldn't note what $user asked Lidarr for: ${e.message}")
+        }
+    }
+
+    /**
+     * An album request for an album Lidarr has already (someone else asked for it, say), which Lidarr itself would turn
+     * down: it's wanted from now on (and looked for, when the request says so), and [user]'s request too. Null when
+     * Lidarr hasn't got it or can't say.
+     */
+    private fun wantedAgain(body: ByteArray, user: String): ProxyAnswer? {
+        val request = jsonObject(body) ?: return null
+        val foreignId = request.text("foreignAlbumId") ?: return null
+        val (status, text) = lidarr.get("api/v1/album", "foreignAlbumId=" + java.net.URLEncoder.encode(foreignId, Charsets.UTF_8))
+        if (status != 200) return null
+        val album = parsed { json.parseToJsonElement(text).jsonArray.firstOrNull() as? JsonObject } ?: return null
+        val id = album.int("id") ?: return null
+        if (album.string("monitored") != "true") {
+            val monitored = lidarr.send(ProxyCall("PUT", "api/v1/album/monitor", null, "application/json", Monitor(listOf(id), true).body()))
+            if (monitored.status !in 200..299) return monitored
+            val search = ((request.field("addOptions") as? JsonObject)?.field("searchForNewAlbum") as? JsonPrimitive)?.booleanOrNull == true
+            if (search) lidarr.send(ProxyCall("POST", "api/v1/command", null, "application/json", Command("AlbumSearch", JsonObject(emptyMap()), listOf(id), null).body()))
+        }
+        note(user, listOf(Requested(System.currentTimeMillis(), albumId = id, foreignAlbumId = album.string("foreignAlbumId") ?: foreignId)))
+        return ProxyAnswer(200, "application/json", JsonObject(album + ("monitored" to JsonPrimitive(true))).toString().encodeToByteArray())
     }
 
     /** [user]'s own picks folder, when there are picks folders. */
@@ -321,11 +598,18 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
             if (artist.string("path") != null) return artist
             artist.string("foreignArtistId") ?: return null
         } else claimed ?: return JsonObject(emptyMap())
-        // Lidarr says for sure whether it has them, and where: asked by MusicBrainz id (old ids of the artist count too), or
-        // else by going through its list of artists as it comes in, which is long and never read whole.
-        val byId = UUID.matches(mbid)
-        val homes = lidarr.read("api/v1/artist", if (byId) "mbId=$mbid" else null) { json.decodeFromStream(ARTIST_HOMES, it) } ?: return null
-        val home = homes.firstOrNull { it.foreignArtistId == mbid } ?: homes.singleOrNull()?.takeIf { byId } ?: return JsonObject(emptyMap())
+        return artistHome(mbid)
+    }
+
+    /**
+     * The artist Lidarr has under the metadata id [foreignArtistId], with their path; an empty object when it hasn't got
+     * them, null when it can't tell. Lidarr says for sure whether it has them, and where: asked by MusicBrainz id (old ids
+     * of the artist count too), or else by going through its list of artists as it comes in, which is long and never read whole.
+     */
+    private fun artistHome(foreignArtistId: String): JsonObject? {
+        val byId = UUID.matches(foreignArtistId)
+        val homes = lidarr.read("api/v1/artist", if (byId) "mbId=$foreignArtistId" else null) { json.decodeFromStream(ARTIST_HOMES, it) } ?: return null
+        val home = homes.firstOrNull { it.foreignArtistId == foreignArtistId } ?: homes.singleOrNull()?.takeIf { byId } ?: return JsonObject(emptyMap())
         return buildJsonObject {
             home.artistName?.let { put("artistName", it) }
             home.path?.let { put("path", it) }
@@ -334,7 +618,7 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
 
     /** The little of a Lidarr artist that says who it is and where its music goes. */
     @Serializable
-    private class ArtistHome(val foreignArtistId: String? = null, val artistName: String? = null, val path: String? = null)
+    private class ArtistHome(val id: Int = 0, val foreignArtistId: String? = null, val artistName: String? = null, val path: String? = null)
 
     /** What [parse] makes of an answer, or null when it isn't what was expected (running out of memory isn't that). */
     private fun <T> parsed(parse: () -> T): T? = try {
@@ -447,6 +731,12 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
 
     private fun JsonObject.string(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
 
+    /** A Lidarr id (they start at 1). */
+    private fun JsonObject.int(key: String) = string(key)?.toIntOrNull()?.takeIf { it > 0 }
+
+    /** A text field of a request, read the way Lidarr reads keys (in any case). */
+    private fun JsonObject.text(key: String) = (field(key) as? JsonPrimitive)?.contentOrNull
+
     private fun denied() = Upstream.error(403, "Only Navidrome admins can do that through the Tonearm server")
 
     private fun badRoot() = Upstream.error(400, "Requests have to go into one of Lidarr's root folders")
@@ -479,5 +769,16 @@ class LidarrProxy(private val lidarr: Upstream, private val requestsForEveryone:
             "mediacover/(artist|album)/\\d+/[A-Za-z0-9_.-]+",
         ).map { Regex("^$it$") }
         private val COMMANDS = setOf("AlbumSearch", "ArtistSearch")
+
+        /** The queue and the wanted lists, which come a page at a time. */
+        private val PAGED = setOf("queue", "wanted/missing", "wanted/cutoff")
+        /** Records asked of Lidarr at once when going through a paged list, and at most how many times. */
+        private const val CHUNK = 1_000
+        private const val MAX_CHUNKS = 100
+        /** Lidarr's page size when none is asked for, and the most records a page has here. */
+        private const val DEFAULT_PAGE = 10
+        private const val MAX_PAGE = 2_000
+        /** How long where the artists live is taken as known. */
+        private const val HOMES_MS = 60_000L
     }
 }

@@ -30,7 +30,10 @@ fun main() {
             System.err.println("LIDARR_URL is set but LIDARR_API_KEY isn't (Lidarr → Settings → General → API Key)")
             exitProcess(2)
         }
-        LidarrProxy(Upstream("Lidarr", url, "X-Api-Key", key), requestsForEveryone = env("LIDARR_REQUESTS")?.lowercase() != "admins", picksRoot = env("PICKS_FOLDER"))
+        LidarrProxy(
+            Upstream("Lidarr", url, "X-Api-Key", key), Requests(dataDir),
+            requestsForEveryone = env("LIDARR_REQUESTS")?.lowercase() != "admins", picksRoot = env("PICKS_FOLDER"),
+        )
     }
     val ai = try {
         Ai.fromEnv(::env)

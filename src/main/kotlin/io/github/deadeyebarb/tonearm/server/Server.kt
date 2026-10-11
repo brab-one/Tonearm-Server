@@ -127,6 +127,8 @@ class TonearmServer(
                 put("dislikes", true)
                 put("stats", true)
                 put("resume", true)
+                // Everyone but admins sees only their own requests in Lidarr's queue and wanted list.
+                put("ownRequests", true)
                 put("radio", mixes != null)
                 put("mix", mixes?.hasAi == true)
                 put("dailyMixes", mixes != null)

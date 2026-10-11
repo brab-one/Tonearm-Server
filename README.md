@@ -5,8 +5,10 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
 - **Tonearm Connect**: the apps see and remote-control each other (phone → desktop) and share likes of
   songs that aren't in the library yet.
 - **Lidarr without handing out its key**: the server holds it, so the apps only need the music server
-  login. Navidrome admins get all of Lidarr (weekly picks included); everyone else can look things up, see
-  downloads and request albums and artists, nothing more.
+  login. Navidrome admins get all of Lidarr (weekly picks included); everyone else can look things up and
+  request albums and artists, nothing more. Only admins see everyone's requests in the downloads and the
+  wanted list, with who asked for each; everyone else sees their own. Requests from before the server kept
+  track of them have no one's name on them, so only admins see those.
 - **Listening history**: the apps tell it every song they play, YouTube Music ones and skipped ones too, so
   the picks follow what each user really listens to, not only what's in the library. The phone's heavy
   rotation, rediscover and Daily Discovery come from it. No Maloja needed (see [Moving off Maloja](#moving-off-maloja)).
@@ -230,7 +232,7 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `NAVIDROME_URL` | (required) | Navidrome as the container reaches it, e.g. `http://192.168.1.11:4533` |
 | `BASE_PATH` | `/connect-tonearm` | The proxy location; requests without the prefix work too |
 | `PORT` | `8790` | |
-| `DATA_DIR` | `/data` | Each user's listening history, shared likes, picks, daily mixes and where their devices left off, small JSON files |
+| `DATA_DIR` | `/data` | Each user's listening history, shared likes, picks, daily mixes, Lidarr requests and where their devices left off, small JSON files |
 | `LIDARR_URL`, `LIDARR_API_KEY` | | Lidarr through the server |
 | `LIDARR_REQUESTS` | `all` | `admins`: only Navidrome admins get Lidarr through the server |
 | `PICKS_FOLDER` | | A folder (as Lidarr sees it) holding one folder per user for their weekly picks ([Private weekly picks](#private-weekly-picks)) |

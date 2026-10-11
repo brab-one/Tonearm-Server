@@ -119,9 +119,10 @@ class PicksFolderTest {
             }
             start()
         }
+        val dataDir = Files.createTempDirectory("tonearm-server").toFile()
         server = TonearmServer(
-            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), Files.createTempDirectory("tonearm-server").toFile(), "test",
-            LidarrProxy(Upstream("Lidarr", "http://127.0.0.1:${lidarr.address.port}", "X-Api-Key", "k"), requestsForEveryone = true, picksRoot = "/picks/"),
+            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test",
+            LidarrProxy(Upstream("Lidarr", "http://127.0.0.1:${lidarr.address.port}", "X-Api-Key", "k"), Requests(dataDir), requestsForEveryone = true, picksRoot = "/picks/"),
         ).start()
     }
 

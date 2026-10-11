@@ -32,7 +32,7 @@ class LidarrCheckTest {
             }
             start()
         }
-        lidarr = LidarrProxy(Upstream("Lidarr", "http://127.0.0.1:${fake.address.port}", "X-Api-Key", "k"), requestsForEveryone = true)
+        lidarr = LidarrProxy(Upstream("Lidarr", "http://127.0.0.1:${fake.address.port}", "X-Api-Key", "k"), Requests(java.nio.file.Files.createTempDirectory("tonearm-server").toFile()), requestsForEveryone = true)
     }
 
     @AfterTest
