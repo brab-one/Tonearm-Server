@@ -142,7 +142,7 @@ data class PicksFolder(val path: String, val ready: Boolean, val problem: String
  * which land in one of Lidarr's own root folders with no tags; nothing gets deleted or reconfigured.
  * Who asked for what is kept in [requests]: admins see it on what's downloading and wanted.
  * With [picksRoot] (PICKS_FOLDER), each user has a folder of their own in it for their weekly picks, which
- * only they can add to and delete from (and which has its own Navidrome library, so only they see it).
+ * only they can add to and delete from, and only they (and admins) see in Lidarr (it has its own Navidrome library too).
  */
 class LidarrProxy(
     private val lidarr: Upstream,
@@ -187,7 +187,8 @@ class LidarrProxy(
 
     /**
      * A look into Lidarr. Everyone but admins sees only what they asked for (or what's in their own picks folder) in the
-     * queue and the wanted lists. Admins see everything, and on what's downloading or wanted who asked for it ("requestedBy").
+     * queue and the wanted lists, and nothing that's in someone else's picks folder. Admins see everything, and on what's
+     * downloading or wanted who asked for it ("requestedBy").
      */
     private fun read(call: ProxyCall, endpoint: String, admin: Boolean, user: String): ProxyAnswer {
         if (!admin && READ.none { it.matches(endpoint) }) return denied()
@@ -205,7 +206,17 @@ class LidarrProxy(
             val theirs = { record: JsonObject -> who(record).isNotEmpty() || inOwnFolder(record, user) }
             return if (endpoint == "queue/details") list(call, theirs) else paged(call, all = false, keep = theirs)
         }
-        return lidarr.send(call)
+        if (admin || picksRoot == null) return lidarr.send(call)
+        return when (endpoint) {
+            "artist" -> list(call, { !inOthersPicks(it, user, artist = true) })
+            "album", "track" -> if (homes() == null) unsure() else list(call, { !inOthersPicks(it, user, artist = false) })
+            else -> Regex("^(artist|album)/\\d+$").matchEntire(endpoint)?.let { match ->
+                val answer = lidarr.send(call)
+                if (answer.status != 200) return answer
+                val item = jsonObject(answer.body) ?: return unsure()
+                if (inOthersPicks(item, user, artist = match.groupValues[1] == "artist")) Upstream.error(404, "Lidarr hasn't got that") else answer
+            } ?: lidarr.send(call)
+        }
     }
 
     /**
@@ -338,19 +349,41 @@ class LidarrProxy(
     private class Homes(val at: Long, val known: BitSet, val picks: Map<Int, String>)
 
     /**
-     * Where Lidarr's artists live as of the last minute, read as Lidarr's list of artists comes in, never whole. What was
-     * known before when Lidarr can't be asked, null when nothing.
+     * Where Lidarr's artists live as of the last minute, or ([fresh]) as of now unless that was a moment ago; read as
+     * Lidarr's list of artists comes in, never whole. What was known before when Lidarr can't be asked, null when nothing.
      */
     @OptIn(ExperimentalSerializationApi::class)
-    private fun homes(): Homes? {
+    private fun homes(fresh: Boolean = false): Homes? {
         val known = homes
         val now = System.currentTimeMillis()
-        if (known != null && now - known.at < HOMES_MS) return known
+        if (known != null && now - known.at < if (fresh) HOMES_AGAIN_MS else HOMES_MS) return known
         val root = picksRoot ?: return null
         val artists = lidarr.read("api/v1/artist") { json.decodeFromStream(ARTIST_HOMES, it) } ?: return known
         val ids = BitSet().apply { artists.forEach { if (it.id > 0) set(it.id) } }
         val picks = artists.filter { a -> a.path?.let { isUnder(it, root) } == true }.associate { it.id to it.path!! }
         return Homes(now, ids, picks).also { homes = it }
+    }
+
+    /**
+     * The picks folder path artist [id] lives in, "" when they're elsewhere, or null when Lidarr doesn't list them (asked
+     * again first, for one added a moment ago) or can't be asked.
+     */
+    private fun homeOf(id: Int): String? {
+        val known = homes()?.takeIf { it.known[id] } ?: homes(fresh = true)?.takeIf { it.known[id] } ?: return null
+        return known.picks[id] ?: ""
+    }
+
+    /**
+     * Whether [item] (an [artist], or an album, track or queue item of one) lives in a picks folder other than [user]'s.
+     * What can't be placed (an artist Lidarr doesn't list) counts as that: nothing is shown that might be someone's picks.
+     */
+    private fun inOthersPicks(item: JsonObject, user: String, artist: Boolean): Boolean {
+        val root = picksRoot ?: return false
+        val path = (if (artist) item else item["artist"] as? JsonObject)?.string("path")
+            ?: ((if (artist) item.int("id") else item.int("artistId"))?.let(::homeOf) ?: return true).ifEmpty { return false }
+        if (clean(path) == null) return true
+        val own = picksFolder(user)
+        return isUnder(path, root) && (own == null || !isUnder(path, own))
     }
 
     /** Whether a queue item or wanted album is in [user]'s own picks folder. */
@@ -551,6 +584,8 @@ class LidarrProxy(
     private fun intoOthersPicks(call: ProxyCall, endpoint: String, user: String, monitor: Monitor?, command: Command?): ProxyAnswer? {
         val root = picksRoot ?: return null
         val artists: List<JsonObject> = when {
+            // Lidarr turns down an artist it has already, which doesn't say why to someone who can't see them.
+            call.method == "POST" && endpoint == "artist" -> listOf(jsonObject(call.body)?.text("foreignArtistId")?.let(::artistHome) ?: return null)
             call.method == "POST" && endpoint == "album" -> {
                 val album = jsonObject(call.body) ?: return badBody()
                 val foreignId = album.field("foreignAlbumId")?.let { (it as? JsonPrimitive)?.contentOrNull } ?: return badBody()
@@ -778,7 +813,8 @@ class LidarrProxy(
         /** Lidarr's page size when none is asked for, and the most records a page has here. */
         private const val DEFAULT_PAGE = 10
         private const val MAX_PAGE = 2_000
-        /** How long where the artists live is taken as known. */
+        /** How long where the artists live is taken as known, and how soon it's asked again for an artist it didn't list. */
         private const val HOMES_MS = 60_000L
+        private const val HOMES_AGAIN_MS = 2_000L
     }
 }

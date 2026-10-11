@@ -216,7 +216,8 @@ pick whose artist Lidarr already keeps elsewhere is skipped, since an album alwa
 the same reason, nobody can request, monitor or search for an album by an artist who is in someone's picks (the
 apps say so). That stays as long as the artist is there, also when its owner keeps an album; an admin can move such
 an artist to a shared root folder in Lidarr (edit the artist, change its root folder, move the files). Non-admins
-can only delete what's in their own picks folder (which the weekly clean-up does for them).
+can only delete what's in their own picks folder (which the weekly clean-up does for them), and don't see what's in
+anyone else's in Lidarr either.
 
 ## Moving off Maloja
 

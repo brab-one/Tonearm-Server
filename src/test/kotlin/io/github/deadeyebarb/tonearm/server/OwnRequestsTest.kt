@@ -271,6 +271,35 @@ class OwnRequestsTest {
     }
 
     @Test
+    fun someoneElsesPicksStayOutOfSight() {
+        fun names(login: List<Pair<String, String>>) = list("artist", login).map { it["artistName"]!!.jsonPrimitive.content }
+        assertEquals(listOf("Low", "Slowdive", "Radiohead", "Mazzy Star", "Filler"), names(bob))
+        assertEquals(listOf("Low", "Slowdive", "Radiohead", "Cocteau Twins", "Filler"), names(carol))
+        assertEquals(artists.size, names(alice).size)
+        assertEquals(404, call("artist/5", bob).first)
+        assertEquals(200, call("artist/4", bob).first)
+        assertEquals(200, call("artist/5", carol).first)
+        assertEquals(404, call("album/50", bob).first)
+        assertEquals(200, call("album/40", bob).first)
+        assertEquals(200, call("album/50", alice).first)
+        assertEquals(listOf(), list("album?artistId=5", bob))
+        assertEquals(1, list("album?artistId=5", carol).size)
+        assertFalse(list("album", bob).any { it["id"]!!.jsonPrimitive.int == 50 })
+        assertEquals(albums.size - 1, list("album", bob).size)
+        assertEquals(listOf(), list("track?artistId=5", bob))
+        assertEquals(listOf(), list("track?albumId=50", bob))
+        assertEquals(1, list("track?albumId=40", bob).size)
+        // An artist Lidarr doesn't list (yet) can't be placed, so nothing of theirs shows.
+        albums[99] = Album(99, "mb-99", 42)
+        assertEquals(404, call("album/99", bob).first)
+        // Asking for an artist who's there says where they are, rather than Lidarr's "already added".
+        val (code, text) = call("artist", bob, "POST", """{"artistName":"Cocteau Twins","foreignArtistId":"mb-cocteau","rootFolderPath":"/music"}""")
+        assertEquals(409, code)
+        assertTrue("Cocteau Twins" in text)
+        assertFalse(received.any { it.startsWith("POST artist") })
+    }
+
+    @Test
     fun anAlbumSomeoneElseAskedForBecomesTheirsToo() {
         requests.add("carol", asked(20))
         fun request(mbid: String, search: Boolean = true) = call("album", bob, "POST", """{"title":"x","foreignAlbumId":"$mbid","monitored":true,""" +
