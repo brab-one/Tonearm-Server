@@ -210,6 +210,7 @@ class LidarrProxy(
         return when (endpoint) {
             "artist" -> list(call, { !inOthersPicks(it, user, artist = true) })
             "album", "track" -> if (homes() == null) unsure() else list(call, { !inOthersPicks(it, user, artist = false) })
+            "artist/lookup", "album/lookup", "search" -> list(call, { !foundInOthersPicks(it, user) })
             else -> Regex("^(artist|album)/\\d+$").matchEntire(endpoint)?.let { match ->
                 val answer = lidarr.send(call)
                 if (answer.status != 200) return answer
@@ -378,9 +379,24 @@ class LidarrProxy(
      * What can't be placed (an artist Lidarr doesn't list) counts as that: nothing is shown that might be someone's picks.
      */
     private fun inOthersPicks(item: JsonObject, user: String, artist: Boolean): Boolean {
-        val root = picksRoot ?: return false
+        if (picksRoot == null) return false
         val path = (if (artist) item else item["artist"] as? JsonObject)?.string("path")
             ?: ((if (artist) item.int("id") else item.int("artistId"))?.let(::homeOf) ?: return true).ifEmpty { return false }
+        return inOthersFolder(path, user)
+    }
+
+    /**
+     * Whether a lookup or search result (an artist, an album, or one of either) is in a picks folder other than [user]'s,
+     * by the path Lidarr gives the artists it has. What isn't in Lidarr yet has no path, and shows.
+     */
+    private fun foundInOthersPicks(item: JsonObject, user: String): Boolean {
+        val artists = listOfNotNull(item, item["artist"] as? JsonObject, (item["album"] as? JsonObject)?.get("artist") as? JsonObject)
+        return artists.mapNotNull { it.string("path") }.any { inOthersFolder(it, user) }
+    }
+
+    /** Whether [path] is in a picks folder other than [user]'s; one with "." or ".." in it might be, so it counts as that. */
+    private fun inOthersFolder(path: String, user: String): Boolean {
+        val root = picksRoot ?: return false
         if (clean(path) == null) return true
         val own = picksFolder(user)
         return isUnder(path, root) && (own == null || !isUnder(path, own))

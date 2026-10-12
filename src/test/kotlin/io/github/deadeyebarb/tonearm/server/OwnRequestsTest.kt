@@ -67,6 +67,9 @@ class OwnRequestsTest {
         """{"id":${album.id},"title":"Album ${album.id}","foreignAlbumId":"${album.mbid}","artistId":${album.artistId},"monitored":${album.monitored}""" +
             (if (withArtist) ""","artist":${artists.first { it.id == album.artistId }.json()}""" else "") + "}"
 
+    /** An artist Lidarr's metadata knows but Lidarr hasn't got, so with no path. */
+    private val newcomer = """{"artistName":"Newcomer","foreignArtistId":"mb-new","folder":"Newcomer"}"""
+
     /** Queue items, without their artist and album (as Lidarr sends them unless asked): one of them Lidarr couldn't match. */
     private val queue = listOf(10, 20, 30, 40, 50).mapIndexed { i, id -> """{"id":${i + 1},"title":"Album $id","albumId":$id,"artistId":${albums[id]!!.artistId}}""" } +
         """{"id":6,"title":"Something unknown"}"""
@@ -118,6 +121,16 @@ class OwnRequestsTest {
                     ex.requestMethod == "PUT" && path == "album/monitor" -> 202 to "[]"
                     ex.requestMethod != "GET" -> 200 to "{}"
                     path == "rootfolder" -> 200 to """[{"path":"/music"},{"path":"/picks/bob"},{"path":"/picks/carol"}]"""
+                    // Lookups and search have what Lidarr has, with its path, and what it hasn't got yet.
+                    path == "artist/lookup" -> 200 to (artists.map { it.json() } + newcomer).joinToString(",", "[", "]")
+                    path == "album/lookup" -> 200 to (listOf(10, 40, 50).map { albumJson(albums[it]!!, withArtist = true) } +
+                        """{"title":"New","foreignAlbumId":"mb-new","artist":$newcomer}""").joinToString(",", "[", "]")
+                    path == "search" -> 200 to listOf(
+                        """{"foreignId":"mb-cocteau","artist":${artists[4].json()}}""",
+                        """{"foreignId":"mb-50","album":${albumJson(albums[50]!!, withArtist = true)}}""",
+                        """{"foreignId":"mb-40","album":${albumJson(albums[40]!!, withArtist = true)}}""",
+                        """{"foreignId":"mb-new","artist":$newcomer}""",
+                    ).joinToString(",", "[", "]")
                     path == "artist" -> 200 to artists.filter { a -> param("mbId")?.let { it == a.mbid } ?: true }.joinToString(",", "[", "]") { it.json() }
                     path.startsWith("artist/") -> artists.firstOrNull { it.id == path.substringAfter('/').toInt() }?.let { 200 to it.json() } ?: (404 to """{"message":"NotFound"}""")
                     path == "album" -> 200 to albums.values.filter { a ->
@@ -297,6 +310,21 @@ class OwnRequestsTest {
         assertEquals(409, code)
         assertTrue("Cocteau Twins" in text)
         assertFalse(received.any { it.startsWith("POST artist") })
+    }
+
+    @Test
+    fun lookupsAndSearchLeaveOutSomeoneElsesPicks() {
+        fun found(path: String, login: List<Pair<String, String>>, key: String) = list(path, login).map { it[key]!!.jsonPrimitive.content }
+        assertEquals(listOf("Low", "Slowdive", "Radiohead", "Mazzy Star", "Filler", "Newcomer"), found("artist/lookup?term=x", bob, "artistName"))
+        assertEquals(listOf("Album 10", "Album 40", "New"), found("album/lookup?term=x", bob, "title"))
+        assertEquals(listOf("mb-40", "mb-new"), found("search?term=x", bob, "foreignId"))
+        assertEquals(listOf("mb-cocteau", "mb-50", "mb-new"), found("search?term=x", carol, "foreignId"))
+        assertEquals(listOf("Album 10", "New"), found("album/lookup?term=x", dave, "title"))
+        // Bob's own picks show where they are, so the apps know they're his.
+        assertEquals("/picks/bob/Mazzy Star", list("album/lookup?term=x", bob)[1]["artist"]!!.jsonObject["path"]!!.jsonPrimitive.content)
+        // Admins get Lidarr's answer as it is.
+        assertEquals(4, list("search?term=x", alice).size)
+        assertEquals(artists.size + 1, list("artist/lookup?term=x", alice).size)
     }
 
     @Test
