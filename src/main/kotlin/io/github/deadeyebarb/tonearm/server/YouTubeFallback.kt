@@ -45,7 +45,12 @@ class YouTubeFallback(
     /** YouTube downloads running at most before a pass is left out. */
     private val maxActive: Int = 2,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** How long "YouTube now" waits for its answer: a proxy in front (Nginx Proxy Manager: 60 s) mustn't cut it off. */
+    private val answerMs: Long = 45_000,
 ) {
+    /** "YouTube now" runs here, so a slow search goes on after its answer said it's still looking. */
+    private val asks = Executors.newCachedThreadPool { Thread(it, "youtube-now").apply { isDaemon = true } }
+
     private val file = File(dataDir, "youtube-fallback.json")
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true; encodeDefaults = false }
 
@@ -269,8 +274,20 @@ class YouTubeFallback(
      */
     fun now(id: Int, title: String, label: String, user: String): JsonObject {
         if (indexers.isNullOrEmpty()) checkIndexers()
-        val result = attempt(id, title, label, youtubeOnly = true, who = "YouTube now for $user")
-            ?: Result(false, problem = "Already looking for “$title”")
+        val asked = asks.submit<Result?> { attempt(id, title, label, youtubeOnly = true, who = "YouTube now for $user") }
+        // Lidarr searches every indexer, which can take longer than a proxy waits: the grab goes on, and the wanted
+        // list shows how it went.
+        val result = try {
+            asked.get(answerMs, TimeUnit.MILLISECONDS) ?: Result(false, problem = "Already looking for “$title”")
+        } catch (_: java.util.concurrent.TimeoutException) {
+            return buildJsonObject {
+                put("grabbed", false)
+                put("running", true)
+                put("problem", "Still looking on YouTube Music for “$title”; your wanted list shows it once it's found")
+            }
+        } catch (e: java.util.concurrent.ExecutionException) {
+            throw e.cause ?: e
+        }
         return buildJsonObject {
             put("grabbed", result.grabbed)
             if (result.grabbed) put("title", result.title) else put("problem", result.problem)

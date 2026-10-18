@@ -59,6 +59,8 @@ class YouTubeFallbackTest {
     private val torrents = """{"id":3,"name":"Knaben","implementation":"Torznab","enableInteractiveSearch":true}"""
     private val youtubeIndexer = """{"id":7,"name":"YouTube","implementation":"YouTubeIndexer","enableAutomaticSearch":false,"enableInteractiveSearch":true}"""
     @Volatile private var indexers = "[$torrents,$youtubeIndexer]"
+    /** How long Lidarr's release search takes. */
+    @Volatile private var searchMs = 0L
 
     private fun iso(ms: Long) = Instant.ofEpochMilli(ms).toString()
 
@@ -126,6 +128,7 @@ class YouTubeFallbackTest {
                     path == "wanted/missing" || path == "wanted/cutoff" -> 200 to page(wanted.toList().map { albumJson(it, param("includeArtist") == "true") })
                     path == "queue" -> 200 to page(queue.toList())
                     path == "release" -> {
+                        if (searchMs > 0) Thread.sleep(searchMs)
                         val id = param("albumId")!!.toInt()
                         200 to (releases[id] ?: listOf(release("yt-$id", 7, 20))).joinToString(",", "[", "]")
                     }
@@ -154,7 +157,8 @@ class YouTubeFallbackTest {
         lidarr.stop(0)
     }
 
-    private fun fallback(minutes: Int = 20, maxActive: Int = 2) = YouTubeFallback(upstream, requests, dataDir, minutes, maxActive, clock = { now })
+    private fun fallback(minutes: Int = 20, maxActive: Int = 2, answerMs: Long = 45_000) =
+        YouTubeFallback(upstream, requests, dataDir, minutes, maxActive, clock = { now }, answerMs = answerMs)
 
     /** The server with [youtube], in place of the one before. */
     private fun serve(youtube: YouTubeFallback) {
@@ -372,6 +376,21 @@ class YouTubeFallbackTest {
         later(1)
         assertEquals(30, youtube.pass()!!.album)
         assertEquals(listOf("yt-20", "yt-10", "yt-30"), grabs())
+    }
+
+    @Test
+    fun aSlowSearchAnswersInTimeAndGrabsAfterwards() {
+        // Longer than a proxy in front would wait: the answer says it's still looking, and the grab comes anyway.
+        searchMs = 1_500
+        serve(fallback(answerMs = 200))
+        val answer = json("api/youtubenow?albumId=10", alice, "POST")
+        assertFalse(answer["grabbed"]!!.jsonPrimitive.boolean)
+        assertTrue(answer["running"]!!.jsonPrimitive.boolean)
+        assertTrue("Still looking" in answer["problem"]!!.jsonPrimitive.content)
+        val until = System.currentTimeMillis() + 10_000
+        while (synchronized(received) { received.none { it.startsWith("POST release") } } && System.currentTimeMillis() < until) Thread.sleep(50)
+        assertTrue(synchronized(received) { received.any { it.startsWith("POST release") } })
+        searchMs = 0
     }
 
     @Test
