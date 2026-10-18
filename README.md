@@ -9,6 +9,10 @@ The Tonearm apps' helper next to your Navidrome, for everyone on it:
   request albums and artists, nothing more. Only admins see everyone's requests in the downloads and the
   wanted list, with who asked for each; everyone else sees their own. Requests from before the server kept
   track of them have no one's name on them, so only admins see those.
+- **YouTube when nothing else comes**: with Tubifarry's YouTube indexer in Lidarr, an album that has been wanted for a
+  while (`YOUTUBE_FALLBACK_MINUTES`, say 20) with nothing downloading comes from YouTube Music, unless a better torrent
+  turned up by then. The apps show when that will be, and their **YouTube now** doesn't wait
+  ([YouTube fallback](#youtube-fallback)).
 - **Listening history**: the apps tell it every song they play, YouTube Music ones and skipped ones too, so
   the picks follow what each user really listens to, not only what's in the library. The phone's heavy
   rotation, rediscover and Daily Discovery come from it. No Maloja needed (see [Moving off Maloja](#moving-off-maloja)).
@@ -74,16 +78,19 @@ Image: `ghcr.io/brab-one/tonearm-server` (amd64 and arm64).
    ```
    LIDARR_URL=http://192.168.1.11:8686
    LIDARR_API_KEY=<Lidarr → Settings → General → API Key>
+   YOUTUBE_FALLBACK_MINUTES=20
    AI_PROVIDER=ollama
    AI_URL=http://192.168.1.11:11435
    TZ=Europe/Vienna
    ```
 
-   For another AI, see [Choosing the AI](#choosing-the-ai). Everything in the `.env` box reaches the server as it
+   For another AI, see [Choosing the AI](#choosing-the-ai); `YOUTUBE_FALLBACK_MINUTES` is in
+   [YouTube fallback](#youtube-fallback). Everything in the `.env` box reaches the server as it
    is; with a compose file from before 1.5.3, which listed each setting, only the listed ones did, so take the
    new one.
 6. Click **Deploy**. The log lists what's set up:
-   `Tonearm server 1.7.0 on port 8790 …`, then a line each for Lidarr, the AI, discovery and the mixes.
+   `Tonearm server 1.8.0 on port 8790 …`, then a line each for Lidarr, the YouTube fallback, the AI, discovery and
+   the mixes.
 7. Check it: open `http://192.168.1.11:8790/connect-tonearm/health`. It should say `ok`.
 
 To update later, open the stack in Dockge and click **Update**.
@@ -123,7 +130,7 @@ docker compose up -d
 5. **Save.** The host's **SSL** settings and **Advanced** tab stay as they are. A client-certificate check
    there (`ssl_verify_client on;`) covers this location too, so the apps' certificate is all they need.
 6. Check it: in a browser that has your client certificate, open
-   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.5.0 is running`.
+   `https://musicdome.brab.one/connect-tonearm/`. It should say `Tonearm server 1.8.0 is running`.
 
 If your host's **Advanced** tab already has its own `location` blocks, add this one there instead of
 using the Custom locations tab:
@@ -146,7 +153,8 @@ Nothing to set up: the apps look for the server at the music server's address an
 Desktop: **Settings → Tonearm Connect** then says "Online through the Tonearm server". Discovery and AI picks
 are under Discover in both apps. Phone 1.10.0 and desktop 1.10.0 send what they play to the history; older
 ones still work, they just don't add to it. Radio, mixes, daily mixes, the History screen and continuing from the
-desktop come with phone and desktop 1.13.0; older apps just don't show them. Other people on your Navidrome just sign in to Tonearm with their
+desktop come with phone and desktop 1.13.0, when wanted albums come from YouTube and YouTube now with 1.14.0; older
+apps just don't show them. Other people on your Navidrome just sign in to Tonearm with their
 own login (and their own client certificate, if your proxy asks for one).
 
 ## Choosing the AI
@@ -181,6 +189,40 @@ the last 5,000 picks, and `<user>.prompt.txt` what the model was last asked.
 for plain JSON from servers that can't do that. A run asks for 20 albums with a few thousand words of
 listening history, so with a paid service each run costs a few cents; picks are renewed weekly or when
 someone asks. Without `AI_PROVIDER`, `OLLAMA_URL` (and `OLLAMA_MODEL`) alone still mean Ollama, as before.
+
+## YouTube fallback
+
+Lidarr can download from YouTube Music with the [Tubifarry](https://github.com/TypNull/Tubifarry) plugin, but on its
+own it would take YouTube right away, before a torrent has had a chance. A delay profile can't hold it back, because
+Tubifarry dates its releases by the album's release date. So the server does the waiting:
+
+1. In Lidarr, set up Tubifarry's **YouTube** indexer and download client. On the indexer, turn **Automatic Search
+   off** (so Lidarr itself never grabs from YouTube) and leave **Interactive Search on** (the server's searches are
+   interactive ones).
+2. Add `YOUTUBE_FALLBACK_MINUTES=20` (or however long a torrent should get) to this server's `.env` and **Update** it.
+   The log says `YouTube fallback: albums wanted for 20 min …` and `YouTube downloads: through Lidarr's indexer
+   "YouTube" (7)`, or that Lidarr has no YouTube indexer.
+3. **If you ran the separate `youtube-fallback` container** (`youtube_fallback.py`), remove it now: in Dockge, open its
+   stack, **Stop** it and **Delete** it. Both would grab the same albums.
+
+Every 2 minutes the server reads Lidarr's monitored wanted albums. One is due once it has been wanted for
+`YOUTUBE_FALLBACK_MINUTES`, nothing for it is in Lidarr's queue, and it wasn't tried in the last 12 hours. The newest
+due album is searched on all indexers, and the release Lidarr ranks best of those it would take is grabbed: a FLAC
+torrent that turned up meanwhile wins, YouTube otherwise (if Lidarr can't grab it, a dead torrent link say, the next
+one). That's one album a pass, and none while `YOUTUBE_FALLBACK_ACTIVE` (2) YouTube downloads are running; finished
+ones waiting for their import don't count. Lidarr upgrades a YouTube copy later, when a better release appears.
+
+An album asked for in the apps counts from when it was asked. Albums that were wanted already when the server first
+looked count from then, and go after everything that came later (the last searched first). When each album was first
+seen and how its last try went are kept in `DATA_DIR/youtube-fallback.json`, so a restart doesn't start the wait over.
+Each try leaves a line in the log (`YouTube fallback: grabbed “…” from YouTube for Low – Double Negative`).
+
+In the apps (1.14.0), wanted albums say when YouTube will be tried, or that it had nothing Lidarr would take (tried
+again 12 hours later). **YouTube now** takes an album's best YouTube release at once, whether or not the fallback is on:
+admins for any album, everyone else for what they asked for and what's in their own weekly picks.
+
+Tubifarry's Queue Cleaner can leave searched-for grabs alone, and the server's grabs count as interactive ones: so it
+cleans up after failed YouTube downloads too, set its **Skip Release Sources** to **Disabled**.
 
 ## Private weekly picks
 
@@ -233,10 +275,12 @@ The apps don't use Maloja anymore; the history lives here now. To bring what Mal
 | `NAVIDROME_URL` | (required) | Navidrome as the container reaches it, e.g. `http://192.168.1.11:4533` |
 | `BASE_PATH` | `/connect-tonearm` | The proxy location; requests without the prefix work too |
 | `PORT` | `8790` | |
-| `DATA_DIR` | `/data` | Each user's listening history, shared likes, picks, daily mixes, Lidarr requests and where their devices left off, small JSON files |
+| `DATA_DIR` | `/data` | Each user's listening history, shared likes, picks, daily mixes, Lidarr requests and where their devices left off, and the YouTube fallback's waits, small JSON files |
 | `LIDARR_URL`, `LIDARR_API_KEY` | | Lidarr through the server |
 | `LIDARR_REQUESTS` | `all` | `admins`: only Navidrome admins get Lidarr through the server |
 | `PICKS_FOLDER` | | A folder (as Lidarr sees it) holding one folder per user for their weekly picks ([Private weekly picks](#private-weekly-picks)) |
+| `YOUTUBE_FALLBACK_MINUTES` | `0` (off) | How long a wanted album waits, with nothing downloading, before it comes from YouTube; e.g. `20` ([YouTube fallback](#youtube-fallback)) |
+| `YOUTUBE_FALLBACK_ACTIVE` | `2` | YouTube downloads running at once at most; while there are that many, the fallback waits |
 | `AI_PROVIDER` | | `ollama`, `openai` or `claude`: the AI for AI picks and search ([Choosing the AI](#choosing-the-ai)) |
 | `AI_URL`, `AI_API_KEY`, `AI_MODEL` | | Where it is, its key, which model |
 | `AI_PULL` | on | `off`: don't download a missing Ollama model |
