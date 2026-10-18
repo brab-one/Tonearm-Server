@@ -102,30 +102,49 @@ class Requests(dataDir: File) {
     }
 }
 
-/** Who asked for the artists and albums Lidarr's records name, from what each user asked for. */
+/** Who asked for the artists and albums Lidarr's records name, and since when, from what each user asked for. */
 class Askers(byUser: Map<String, List<Requested>>) {
-    private val albums = HashMap<Int, MutableSet<String>>()
-    private val foreignAlbums = HashMap<String, MutableSet<String>>()
-    private val artists = HashMap<Int, MutableSet<String>>()
-    private val foreignArtists = HashMap<String, MutableSet<String>>()
+    /** Who asked for each album or artist by one kind of id, and the earliest time it was asked for. */
+    private class Index<K> {
+        val users = HashMap<K, MutableSet<String>>()
+        val since = HashMap<K, Long>()
+
+        fun add(key: K, user: String, at: Long) {
+            users.getOrPut(key) { HashSet() } += user
+            since.merge(key, at, ::minOf)
+        }
+    }
+
+    private val albums = Index<Int>()
+    private val foreignAlbums = Index<String>()
+    private val artists = Index<Int>()
+    private val foreignArtists = Index<String>()
 
     init {
         for ((user, asked) in byUser) for (r in asked) {
             if (r.isAlbum) {
-                r.albumId?.let { albums.getOrPut(it) { HashSet() } += user }
-                r.foreignAlbumId?.let { foreignAlbums.getOrPut(it) { HashSet() } += user }
+                r.albumId?.let { albums.add(it, user, r.at) }
+                r.foreignAlbumId?.let { foreignAlbums.add(it, user, r.at) }
             } else {
-                r.artistId?.let { artists.getOrPut(it) { HashSet() } += user }
-                r.foreignArtistId?.let { foreignArtists.getOrPut(it) { HashSet() } += user }
+                r.artistId?.let { artists.add(it, user, r.at) }
+                r.foreignArtistId?.let { foreignArtists.add(it, user, r.at) }
             }
         }
     }
 
     /** Everyone who asked for this album, or for its whole artist, by name. */
     fun of(albumId: Int?, foreignAlbumId: String?, artistId: Int?, foreignArtistId: String?): List<String> = buildSet {
-        albumId?.let { albums[it]?.let(::addAll) }
-        foreignAlbumId?.let { foreignAlbums[it]?.let(::addAll) }
-        artistId?.let { artists[it]?.let(::addAll) }
-        foreignArtistId?.let { foreignArtists[it]?.let(::addAll) }
+        albumId?.let { albums.users[it]?.let(::addAll) }
+        foreignAlbumId?.let { foreignAlbums.users[it]?.let(::addAll) }
+        artistId?.let { artists.users[it]?.let(::addAll) }
+        foreignArtistId?.let { foreignArtists.users[it]?.let(::addAll) }
     }.sorted()
+
+    /** When this album, or its whole artist, was asked for (the earliest request kept), or null when nobody did. */
+    fun since(albumId: Int?, foreignAlbumId: String?, artistId: Int?, foreignArtistId: String?): Long? = listOfNotNull(
+        albumId?.let { albums.since[it] },
+        foreignAlbumId?.let { foreignAlbums.since[it] },
+        artistId?.let { artists.since[it] },
+        foreignArtistId?.let { foreignArtists.since[it] },
+    ).minOrNull()
 }

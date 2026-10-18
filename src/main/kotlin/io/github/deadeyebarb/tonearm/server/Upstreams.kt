@@ -56,8 +56,9 @@ class Upstream(
 ) {
     private val base = baseUrl.trimEnd('/')
 
-    fun send(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body): ProxyAnswer {
-        val request = request(call, extraQuery, body)
+    /** [call] as it is; [timeout] is how long its answer may take (a release search across all indexers takes a while). */
+    fun send(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body, timeout: Duration = TIMEOUT): ProxyAnswer {
+        val request = request(call, extraQuery, body, timeout)
         return try {
             val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())
             ProxyAnswer(
@@ -106,11 +107,11 @@ class Upstream(
 
     class Fetched<T>(val value: T?, val answer: ProxyAnswer)
 
-    private fun request(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body): HttpRequest {
+    private fun request(call: ProxyCall, extraQuery: List<Pair<String, String>> = emptyList(), body: ByteArray = call.body, timeout: Duration = TIMEOUT): HttpRequest {
         val query = (keptQuery(call.rawQuery) + extraQuery.map { (k, v) -> k + "=" + java.net.URLEncoder.encode(v, Charsets.UTF_8) })
             .joinToString("&")
         return HttpRequest.newBuilder(URI.create("$base/${call.path}" + if (query.isEmpty()) "" else "?$query"))
-            .timeout(Duration.ofSeconds(90))
+            .timeout(timeout)
             .method(call.method, if (body.isEmpty()) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofByteArray(body))
             .apply {
                 keyHeader?.let { header(it, key) }
@@ -127,6 +128,7 @@ class Upstream(
     companion object {
         /** The apps' Subsonic login and anything that could pass another key. */
         private val DROPPED = setOf("u", "t", "s", "p", "apikey", "v", "c", "f", "key")
+        private val TIMEOUT: Duration = Duration.ofSeconds(90)
 
         fun error(status: Int, message: String) =
             ProxyAnswer(status, "application/json", JsonObject(mapOf("error" to JsonPrimitive(message))).toString().encodeToByteArray())
@@ -143,12 +145,14 @@ data class PicksFolder(val path: String, val ready: Boolean, val problem: String
  * Who asked for what is kept in [requests]: admins see it on what's downloading and wanted.
  * With [picksRoot] (PICKS_FOLDER), each user has a folder of their own in it for their weekly picks, which
  * only they can add to and delete from, and only they (and admins) see in Lidarr (it has its own Navidrome library too).
+ * [youtube] is the YouTube fallback, which reads Lidarr and grabs from it on its own.
  */
 class LidarrProxy(
     private val lidarr: Upstream,
     private val requests: Requests,
     private val requestsForEveryone: Boolean,
     private val picksRoot: String? = null,
+    val youtube: YouTubeFallback? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true }
     @Volatile private var roots: Pair<Set<String>, Long>? = null
@@ -281,10 +285,10 @@ class LidarrProxy(
     }
 
     /** A page of Lidarr's queue or wanted list as it answered, with how many [records] it had. */
-    private class LidarrPage(val sortKey: String?, val sortDirection: String?, val totalRecords: Long, val records: Int)
+    internal class LidarrPage(val sortKey: String?, val sortDirection: String?, val totalRecords: Long, val records: Int)
 
     /** Reads a page of Lidarr's queue or wanted list as it comes in, handing each record to [each] and letting go of it. */
-    private class PageReader(private val each: (JsonObject) -> Unit) : DeserializationStrategy<LidarrPage> {
+    internal class PageReader(private val each: (JsonObject) -> Unit) : DeserializationStrategy<LidarrPage> {
         override val descriptor = buildClassSerialDescriptor("LidarrPage") {
             element<JsonElement>("sortKey")
             element<JsonElement>("sortDirection")

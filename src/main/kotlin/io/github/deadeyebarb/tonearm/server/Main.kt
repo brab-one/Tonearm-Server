@@ -10,7 +10,8 @@ import kotlin.system.exitProcess
  * The Tonearm server: Tonearm Connect for every user of a Navidrome server, Lidarr without handing out its key,
  * listening history, picks, radio and mixes. Settings come from the environment: NAVIDROME_URL (required), BASE_PATH (default
  * /connect-tonearm), PORT (8790), DATA_DIR (/data); optional LIDARR_URL + LIDARR_API_KEY (+ LIDARR_REQUESTS =
- * all | admins, + PICKS_FOLDER for each user's weekly picks in a folder of their own), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
+ * all | admins, + PICKS_FOLDER for each user's weekly picks in a folder of their own, + YOUTUBE_FALLBACK_MINUTES and
+ * YOUTUBE_FALLBACK_ACTIVE for wanted albums from YouTube when nothing else came in time), and an AI for album suggestions: AI_PROVIDER (ollama, openai or claude) with AI_URL, AI_API_KEY
  * and AI_MODEL (+ AI_PULL, AI_CONTEXT for Ollama), or just OLLAMA_URL (+ OLLAMA_MODEL). Discovery picks and similar artists come from Deezer's public
  * API (DISCOVERY=off turns that off). MALOJA_URL (+ MALOJA_API_KEY, MALOJA_USERS) only brings a Maloja's
  * history over, once. TRUSTED_PROXIES: the proxies whose X-Forwarded-For counts (loopback, Docker's networks and the container's gateway).
@@ -25,14 +26,22 @@ fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8790
     val dataDir = File(System.getenv("DATA_DIR")?.takeIf { it.isNotBlank() } ?: "/data")
     val version = TonearmServer::class.java.`package`?.implementationVersion ?: "dev"
+    val youtubeMinutes = count("YOUTUBE_FALLBACK_MINUTES", 0, "minutes a wanted album waits before YouTube (0 is off)")
+    val youtubeActive = count("YOUTUBE_FALLBACK_ACTIVE", 2, "YouTube downloads at once, at least 1").takeIf { it > 0 } ?: run {
+        System.err.println("YOUTUBE_FALLBACK_ACTIVE has to be at least 1")
+        exitProcess(2)
+    }
     val lidarr = env("LIDARR_URL")?.let { url ->
         val key = env("LIDARR_API_KEY") ?: run {
             System.err.println("LIDARR_URL is set but LIDARR_API_KEY isn't (Lidarr → Settings → General → API Key)")
             exitProcess(2)
         }
+        val upstream = Upstream("Lidarr", url, "X-Api-Key", key)
+        val requests = Requests(dataDir)
         LidarrProxy(
-            Upstream("Lidarr", url, "X-Api-Key", key), Requests(dataDir),
+            upstream, requests,
             requestsForEveryone = env("LIDARR_REQUESTS")?.lowercase() != "admins", picksRoot = env("PICKS_FOLDER"),
+            youtube = YouTubeFallback(upstream, requests, dataDir, youtubeMinutes, youtubeActive),
         )
     }
     val ai = try {
@@ -69,6 +78,13 @@ fun main() {
     println("Proxies trusted to say who they forward for: " + (proxies ?: ("127.0.0.0/8, ::1, 172.16.0.0/12 (Docker's networks)" + (gateway?.let { ", ${it.hostAddress} (this container's gateway)" } ?: ""))))
     println("Lidarr: " + (env("LIDARR_URL")?.let { "$it, " + if (lidarr!!.available(false)) "requests for everyone" else "admins only" } ?: "not set up"))
     env("PICKS_FOLDER")?.let { println("Weekly picks: each user's in their own folder in $it (as Lidarr sees it)" + if (lidarr == null) ", but there's no Lidarr" else "") }
+    println("YouTube fallback: " + when {
+        youtubeMinutes == 0 -> "off (YOUTUBE_FALLBACK_MINUTES)"
+        lidarr == null -> "YOUTUBE_FALLBACK_MINUTES is set, but there's no Lidarr"
+        else -> "albums wanted for $youtubeMinutes min with nothing downloading come from YouTube, $youtubeActive YouTube downloads at most at once"
+    })
+    // Also with the fallback off: it keeps an eye on Lidarr's YouTube indexer, for YouTube now.
+    lidarr?.youtube?.start()
     println("AI picks and search: " + (ai?.let { "${it.name.takeUnless { n -> n == "The AI" } ?: "OpenAI-style API"} with ${it.model}" } ?: "not set up (AI_PROVIDER)"))
     println("Discovery and similar artists: " + if (discovery != null) "from Deezer" else "off")
     println("Radio and daily mixes: from the library; " + (ai?.let { "AI mixes with ${it.label}" } ?: "AI mixes: off (no AI)"))
@@ -100,3 +116,12 @@ private fun malojaImport(url: String, key: String?, users: String?, history: His
 }
 
 private fun env(name: String): String? = System.getenv(name)?.takeIf { it.isNotBlank() }
+
+/** A whole number from setting [name] ([default] when it isn't set); one that isn't says what it should be ([what]) and stops. */
+private fun count(name: String, default: Int, what: String): Int {
+    val text = env(name) ?: return default
+    return text.trim().toIntOrNull()?.takeIf { it >= 0 } ?: run {
+        System.err.println("$name is \"$text\"; give a whole number: $what")
+        exitProcess(2)
+    }
+}
