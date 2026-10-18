@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The Tonearm server's HTTP side. Everything lives under [basePath] (where the proxy sends it):
- * `api/<op>` for Connect, picks and listening history, `lidarr/…` for Lidarr with the server's key,
+ * `api/<op>` for Connect, picks, listening history and YouTube now, `lidarr/…` for Lidarr with the server's key,
  * `health` for Docker, and a short status text at the root.
  */
 class TonearmServer(
@@ -135,6 +135,11 @@ class TonearmServer(
                 recommendations?.let { put("ai", it.label) }
                 // Where this user's weekly picks download to, when each user has their own.
                 lidarr?.takeIf { it.available(login.admin) }?.picksFolder(user)?.let { put("picksFolder", it) }
+                // How long wanted albums wait for YouTube, and whether "YouTube now" can be asked.
+                lidarr?.takeIf { it.available(login.admin) }?.youtube?.let { youtube ->
+                    if (youtube.active) put("youtubeFallback", youtube.minutes)
+                    if (youtube.hasIndexer) put("youtubeNow", true)
+                }
             }
             "picksfolder" -> {
                 val proxy = lidarr?.takeIf { it.available(login.admin) } ?: return error(exchange, 404, "This Tonearm server has no Lidarr for you")
@@ -148,6 +153,12 @@ class TonearmServer(
                     put("ready", folder.ready)
                     folder.problem?.let { put("problem", it) }
                 }
+            }
+            "youtubenow" -> {
+                if (exchange.requestMethod != "POST") return error(exchange, 405, "youtubenow is a POST")
+                val proxy = lidarr ?: return error(exchange, 404, "This Tonearm server has no Lidarr set up")
+                val album = query["albumId"]?.toIntOrNull()?.takeIf { it > 0 } ?: return error(exchange, 400, "albumId is required")
+                return relay(exchange, proxy.youtubeNow(album, login.admin, user))
             }
             "publish" -> {
                 if (device.isNullOrEmpty() || payload.isEmpty()) return error(exchange, 400, "device and payload are required")

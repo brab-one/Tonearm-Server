@@ -145,7 +145,7 @@ data class PicksFolder(val path: String, val ready: Boolean, val problem: String
  * Who asked for what is kept in [requests]: admins see it on what's downloading and wanted.
  * With [picksRoot] (PICKS_FOLDER), each user has a folder of their own in it for their weekly picks, which
  * only they can add to and delete from, and only they (and admins) see in Lidarr (it has its own Navidrome library too).
- * [youtube] is the YouTube fallback, which reads Lidarr and grabs from it on its own.
+ * With [youtube], wanted albums say when YouTube is tried for them, and "YouTube now" grabs one from YouTube at once.
  */
 class LidarrProxy(
     private val lidarr: Upstream,
@@ -200,15 +200,19 @@ class LidarrProxy(
             val album = endpoint.startsWith("wanted/")
             val askers = Askers(if (admin) requests.everyone() else mapOf(user to requests.of(user)))
             fun who(record: JsonObject) = askers.of(record, album)
+            // Missing albums say when YouTube is tried for them, for everyone.
+            val youtube = youtube?.takeIf { endpoint == "wanted/missing" && it.active }
+            fun withYoutube(record: JsonObject) = youtube?.annotate(record, askers.since(record)) ?: record
             if (admin) {
                 val shown = { record: JsonObject ->
                     val by = who(record)
-                    if (by.isEmpty()) record else JsonObject(record + ("requestedBy" to JsonArray(by.map(::JsonPrimitive))))
+                    val tagged = withYoutube(record)
+                    if (by.isEmpty()) tagged else JsonObject(tagged + ("requestedBy" to JsonArray(by.map(::JsonPrimitive))))
                 }
                 return if (endpoint == "queue/details") list(call, shown = shown) else paged(call, all = true, shown = shown)
             }
             val theirs = { record: JsonObject -> who(record).isNotEmpty() || inOwnFolder(record, user) }
-            return if (endpoint == "queue/details") list(call, theirs) else paged(call, all = false, keep = theirs)
+            return if (endpoint == "queue/details") list(call, theirs) else paged(call, all = false, keep = theirs, shown = ::withYoutube)
         }
         if (admin || picksRoot == null) return lidarr.send(call)
         return when (endpoint) {
@@ -237,6 +241,35 @@ class LidarrProxy(
             artistId = record.int("artistId") ?: artist?.int("id"),
             foreignArtistId = artist?.string("foreignArtistId"),
         )
+    }
+
+    /** When a wanted album (or its whole artist) was asked for, of what these askers asked. */
+    private fun Askers.since(record: JsonObject): Long? {
+        val artist = record["artist"] as? JsonObject
+        return since(record.int("id"), record.string("foreignAlbumId"), record.int("artistId") ?: artist?.int("id"), artist?.string("foreignArtistId"))
+    }
+
+    /**
+     * "YouTube now" for Lidarr's album [albumId]: its best approved release from Lidarr's YouTube indexer, grabbed at once.
+     * Admins may ask for any album, everyone else for the ones they asked for (or whose whole artist they did) and the ones
+     * in their own picks folder; nobody for one in someone else's picks, which would download into that person's library.
+     */
+    fun youtubeNow(albumId: Int, admin: Boolean, user: String): ProxyAnswer {
+        if (!available(admin)) return Upstream.error(403, "Requests through the Tonearm server are for Navidrome admins here")
+        val youtube = youtube ?: return Upstream.error(404, "This Tonearm server has no YouTube downloads")
+        if (!youtube.hasIndexer && youtube.checkIndexers().isNullOrEmpty()) return Upstream.error(404, "Lidarr has no YouTube indexer (Tubifarry's YouTube)")
+        val found = lidarr.send(ProxyCall("GET", "api/v1/album/$albumId", null, null, ByteArray(0)))
+        if (found.status == 404) return Upstream.error(404, "Lidarr hasn't got that album")
+        if (found.status != 200) return if (found.status == 502) found else Upstream.error(502, "Lidarr answered HTTP ${found.status} about that album")
+        val album = jsonObject(found.body) ?: return unsure()
+        if (!admin && Askers(mapOf(user to requests.of(user))).of(album, album = true).isEmpty() && !inOwnFolder(album, user)) {
+            return Upstream.error(403, "Only albums you asked for, or ones in your own weekly picks, can come from YouTube for you")
+        }
+        val search = Command("AlbumSearch", JsonObject(emptyMap()), listOf(albumId), null)
+        intoOthersPicks(ProxyCall("POST", "api/v1/command", null, null, ByteArray(0)), "command", user, null, search)?.let { return it }
+        val title = album.string("title") ?: "album $albumId"
+        val label = listOfNotNull((album["artist"] as? JsonObject)?.string("artistName"), title).joinToString(" – ")
+        return ProxyAnswer(200, "application/json", youtube.now(albumId, title, label, user).toString().encodeToByteArray())
     }
 
     /**

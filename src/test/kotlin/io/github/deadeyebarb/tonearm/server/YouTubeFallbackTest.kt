@@ -2,11 +2,21 @@ package io.github.deadeyebarb.tonearm.server
 
 import com.sun.net.httpserver.HttpServer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import java.io.File
 import java.net.InetSocketAddress
+import java.net.URI
 import java.net.URLDecoder
+import java.net.URLEncoder
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.time.Instant
 import java.util.concurrent.Executors
@@ -19,15 +29,18 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Wanted albums from YouTube when nothing else came in time, against a fake Lidarr with a torrent indexer and Tubifarry's
- * YouTube one (id 7). Each album's releases are a YouTube one Lidarr would take unless a test says otherwise. Time is the
- * test's.
+ * Wanted albums from YouTube when nothing else came in time, and "YouTube now", against a fake Navidrome that knows alice
+ * (an admin), bob and carol, and a fake Lidarr (PICKS_FOLDER=/picks) with a torrent indexer and Tubifarry's YouTube one
+ * (id 7). Each album's releases are a YouTube one Lidarr would take unless a test says otherwise. Time is the test's.
  */
 class YouTubeFallbackTest {
+    private lateinit var navidrome: HttpServer
     private lateinit var lidarr: HttpServer
+    private var server: TonearmServer? = null
     private lateinit var dataDir: File
     private lateinit var requests: Requests
     private lateinit var upstream: Upstream
+    private val http = HttpClient.newHttpClient()
     private var now = System.currentTimeMillis()
     /** What reached the fake Lidarr (method, path and query), and the bodies of its grabs. */
     private val received = mutableListOf<String>()
@@ -72,6 +85,21 @@ class YouTubeFallbackTest {
 
     @BeforeTest
     fun start() {
+        navidrome = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            createContext("/rest/") { ex ->
+                val q = ex.requestURI.rawQuery.split('&').associate { URLDecoder.decode(it.substringBefore('='), Charsets.UTF_8) to URLDecoder.decode(it.substringAfter('='), Charsets.UTF_8) }
+                val name = mapOf("alicekey" to "Alice", "bobkey" to "Bob", "carolkey" to "Carol")[q["apiKey"]]
+                val body = when {
+                    name == null -> """{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong API key"}}}"""
+                    ex.requestURI.path.endsWith("/tokenInfo.view") -> """{"subsonic-response":{"status":"ok","tokenInfo":{"username":"$name"}}}"""
+                    else -> """{"subsonic-response":{"status":"ok","user":{"username":"$name","adminRole":${name == "Alice"}}}}"""
+                }
+                val bytes = body.encodeToByteArray()
+                ex.sendResponseHeaders(200, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
+            start()
+        }
         lidarr = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex ->
                 val body = ex.requestBody.readAllBytes().decodeToString()
@@ -121,14 +149,49 @@ class YouTubeFallbackTest {
 
     @AfterTest
     fun stop() {
+        server?.stop()
+        navidrome.stop(0)
         lidarr.stop(0)
     }
 
     private fun fallback(minutes: Int = 20, maxActive: Int = 2) = YouTubeFallback(upstream, requests, dataDir, minutes, maxActive, clock = { now })
 
+    /** The server with [youtube], in place of the one before. */
+    private fun serve(youtube: YouTubeFallback) {
+        server?.stop()
+        youtube.checkIndexers()
+        server = TonearmServer(
+            0, "/connect-tonearm", NavidromeAuth("http://127.0.0.1:${navidrome.address.port}/"), dataDir, "test",
+            LidarrProxy(upstream, requests, requestsForEveryone = true, picksRoot = "/picks", youtube = youtube),
+        ).start()
+    }
+
     private fun later(minutes: Long) {
         now += minutes * 60_000L
     }
+
+    private val alice = "apiKey=alicekey"
+    private val bob = "apiKey=bobkey"
+    private val carol = "apiKey=carolkey"
+
+    private fun call(path: String, login: String, method: String = "GET"): Pair<Int, String> {
+        val (route, params) = path.split('?', limit = 2).let { it[0] to it.getOrNull(1) }
+        val request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${server!!.boundPort}/connect-tonearm/$route?$login" + (params?.let { "&$it" } ?: "")))
+            .method(method, HttpRequest.BodyPublishers.noBody()).build()
+        return http.send(request, HttpResponse.BodyHandlers.ofString()).let { it.statusCode() to it.body() }
+    }
+
+    private fun json(path: String, login: String, method: String = "GET"): JsonObject = call(path, login, method).let { (code, text) ->
+        assertEquals(200, code, text)
+        Json.parseToJsonElement(text).jsonObject
+    }
+
+    private fun youtubeNow(albumId: Int, login: String) = call("api/youtubenow?albumId=$albumId", login, "POST")
+
+    /** Wanted albums as [login] sees them through the server, by id. */
+    private fun wantedAs(login: String, list: String = "missing"): Map<Int, JsonObject> =
+        json("lidarr/api/v1/wanted/$list?page=1&pageSize=50&includeArtist=true", login)["records"]!!.jsonArray
+            .associate { it.jsonObject["id"]!!.jsonPrimitive.int to it.jsonObject }
 
     private fun grabs() = synchronized(grabBodies) { grabBodies.map { Json.parseToJsonElement(it).jsonObject["guid"]!!.jsonPrimitive.content } }
 
@@ -309,5 +372,139 @@ class YouTubeFallbackTest {
         later(1)
         assertEquals(30, youtube.pass()!!.album)
         assertEquals(listOf("yt-20", "yt-10", "yt-30"), grabs())
+    }
+
+    @Test
+    fun youtubeNowIsForAdminsAndForWhatYouAskedFor() {
+        releases[10] = listOf(release("flac-10", 3, 5), release("yt-10", 7, 20, title = "Low - Album 10 [AAC 256]"), release("yt-10-other", 7, 10, approved = false))
+        serve(fallback())
+        // An admin, any album: YouTube's best, even with a better torrent there.
+        val answer = json("api/youtubenow?albumId=10", alice, "POST")
+        assertTrue(answer["grabbed"]!!.jsonPrimitive.boolean)
+        assertEquals("Low - Album 10 [AAC 256]", answer["title"]!!.jsonPrimitive.content)
+        assertEquals(listOf("yt-10"), grabs())
+        // Bob only for what he asked for.
+        assertEquals(403, youtubeNow(20, bob).first)
+        requests.add("bob", listOf(Requested(now, albumId = 20)))
+        assertTrue(json("api/youtubenow?albumId=20", bob, "POST")["grabbed"]!!.jsonPrimitive.boolean)
+        // A whole artist asked for counts for its albums.
+        assertEquals(403, youtubeNow(11, carol).first)
+        requests.add("carol", listOf(Requested(now, foreignArtistId = "mb-artist-1")))
+        assertTrue(json("api/youtubenow?albumId=11", carol, "POST")["grabbed"]!!.jsonPrimitive.boolean)
+        // What's in his own weekly picks is his; carol's isn't, and nobody's to download into, admins' included.
+        assertTrue(json("api/youtubenow?albumId=30", bob, "POST")["grabbed"]!!.jsonPrimitive.boolean)
+        assertEquals(403, youtubeNow(40, bob).first)
+        val (code, text) = youtubeNow(40, alice)
+        assertEquals(409, code)
+        assertTrue("Cocteau Twins" in text, text)
+        assertEquals(listOf("yt-10", "yt-20", "yt-11", "yt-30"), grabs())
+        // Nothing on YouTube that Lidarr would take.
+        releases[12] = listOf(release("yt-12", 7, 20, approved = false), release("flac-12", 3, 5))
+        val none = json("api/youtubenow?albumId=12", alice, "POST")
+        assertFalse(none["grabbed"]!!.jsonPrimitive.boolean)
+        assertEquals("No YouTube Music match for “Album 12”", none["problem"]!!.jsonPrimitive.content)
+        // Lidarr can't grab it: said, without Lidarr's own answer (it has the indexer's key).
+        releases[13] = listOf(release("yt-13", 7, 20))
+        dead += "yt-13"
+        val failed = call("api/youtubenow?albumId=13", alice, "POST")
+        assertEquals(200, failed.first)
+        assertFalse("prowlarr-secret" in failed.second, failed.second)
+        assertFalse(Json.parseToJsonElement(failed.second).jsonObject["grabbed"]!!.jsonPrimitive.boolean)
+        // Asked the wrong way, for an album Lidarr hasn't got, or for none.
+        assertEquals(405, call("api/youtubenow?albumId=10", alice).first)
+        assertEquals(404, youtubeNow(99, alice).first)
+        assertEquals(400, call("api/youtubenow", alice, "POST").first)
+        // Tried with nothing grabbed: the fallback leaves it for 12 hours.
+        wanted.clear()
+        wanted += 12
+        val youtube = fallback()
+        youtube.pass()
+        later(20)
+        assertEquals(0, youtube.pass()!!.due)
+    }
+
+    @Test
+    fun helloSaysWhatYouTubeCanDo() {
+        serve(fallback())
+        for (login in listOf(alice, bob)) {
+            val hello = json("api/hello", login)
+            assertEquals(20, hello["youtubeFallback"]!!.jsonPrimitive.int)
+            assertTrue(hello["youtubeNow"]!!.jsonPrimitive.boolean)
+        }
+        // Off, YouTube now still works.
+        serve(fallback(minutes = 0))
+        val off = json("api/hello", bob)
+        assertFalse("youtubeFallback" in off)
+        assertTrue(off["youtubeNow"]!!.jsonPrimitive.boolean)
+        assertTrue(json("api/youtubenow?albumId=10", alice, "POST")["grabbed"]!!.jsonPrimitive.boolean)
+        assertNull(fallback(minutes = 0).pass())
+        // Without a YouTube indexer that searches, neither; and the fallback doesn't look.
+        for (list in listOf("[$torrents]", "[$torrents,${youtubeIndexer.replace("\"enableInteractiveSearch\":true", "\"enableInteractiveSearch\":false")}]")) {
+            indexers = list
+            val youtube = fallback()
+            serve(youtube)
+            val hello = json("api/hello", alice)
+            assertFalse("youtubeFallback" in hello)
+            assertFalse("youtubeNow" in hello)
+            assertEquals(404, youtubeNow(10, alice).first)
+            assertNull(youtube.pass())
+        }
+        assertFalse(received.any { it.startsWith("GET wanted") })
+        // One that's added later is found on the next look.
+        indexers = "[$torrents,$youtubeIndexer]"
+        val youtube = fallback()
+        assertEquals(0, youtube.pass()!!.due)
+    }
+
+    @Test
+    fun wantedAlbumsSayWhenYouTubeIsTried() {
+        wanted.clear()
+        wanted += listOf(10, 11, 12, 20, 30)
+        releaseDates[12] = now + 3 * 24 * 3_600_000L
+        lastSearch[11] = now - 60_000L
+        releases[11] = listOf(release("yt-11", 7, 20, approved = false))
+        requests.add("bob", listOf(Requested(now - 5 * 60_000L, albumId = 10)), now)
+        val start = now
+        val youtube = fallback()
+        serve(youtube)
+        youtube.pass()
+        later(15)
+        assertEquals(10, youtube.pass()!!.album)
+        later(5)
+        // 11 (searched last) grabs nothing.
+        assertEquals(11, youtube.pass()!!.album)
+        val tried = now
+        // Bob asked for 13 a moment ago, before the fallback's next look.
+        later(1)
+        wanted += 13
+        requests.add("bob", listOf(Requested(now - 60_000L, albumId = 13)))
+        fun at(record: JsonObject?) = record?.get("youtubeAt")?.jsonPrimitive?.long
+        fun triedAt(record: JsonObject?) = record?.get("youtubeTried")?.jsonPrimitive?.long
+
+        val all = wantedAs(alice)
+        assertEquals(listOf(10, 11, 12, 20, 30, 13), all.keys.toList())
+        // Grabbed: the queue says the rest.
+        assertNull(at(all[10]))
+        assertNull(triedAt(all[10]))
+        assertEquals(listOf("bob"), all[10]!!["requestedBy"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(tried, triedAt(all[11]))
+        assertNull(at(all[11]))
+        // Not out yet: when it is.
+        assertEquals(releaseDates[12], at(all[12]))
+        assertEquals(start + 20 * 60_000L, at(all[20]))
+        assertEquals(start + 20 * 60_000L, at(all[30]))
+        assertEquals(now - 60_000L + 20 * 60_000L, at(all[13]))
+        // Bob sees his own, tagged the same way.
+        val his = wantedAs(bob)
+        assertEquals(listOf(10, 30, 13), his.keys.toList())
+        assertNull(at(his[10]))
+        assertEquals(start + 20 * 60_000L, at(his[30]))
+        assertEquals(at(all[13]), at(his[13]))
+        // Carol asked for nothing.
+        assertEquals(listOf(), wantedAs(carol).keys.toList())
+        // The cutoff list isn't the fallback's, and with the fallback off nothing is tagged.
+        assertFalse(wantedAs(alice, "cutoff").values.any { "youtubeAt" in it || "youtubeTried" in it })
+        serve(fallback(minutes = 0))
+        assertFalse(wantedAs(alice).values.any { "youtubeAt" in it || "youtubeTried" in it })
     }
 }
